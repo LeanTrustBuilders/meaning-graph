@@ -38,7 +38,8 @@ this module compensates for:
 ## Entry points
 
 `Context.of env rootPrefix` computes the project-wide tables once; `Context.declDeps` then answers
-per declaration, threading a memo cache. `declDepsOf` wraps both for the common
+per declaration, threading a memo cache, and `Context.depsOf` answers for many declarations in
+parallel. `DepsRequest` says which lists to compute. `declDepsOf` wraps it all for the common
 "give me everything" case.
 
 The graph passes (`reverseDeps`, `transitiveDeps`) are deliberately stated over plain `Name`-keyed
@@ -141,10 +142,15 @@ def hasPrefixName (n prefixName : Name) : Bool :=
     | .anonymous => false
 
 /-- The module `name` was declared in, if `env` records one (declarations added to the current
-module, rather than imported, have no module index). -/
+module, rather than imported, have no module index).
+
+Reads `env.header.modules` at the index, not `env.header.moduleNames`: the latter builds the array of
+every module's name on each call, which on a Mathlib-sized environment (10,000 modules) costs about
+170 µs, against 50 ns for the lookup itself. Every classification below calls this once per
+constant, and `expandThroughInternals` once per constant it visits. -/
 def moduleNameOf (env : Environment) (name : Name) : Option Name := do
   let idx ← env.getModuleIdxFor? name
-  env.header.moduleNames[idx.toNat]?
+  return (← env.header.modules[idx.toNat]?).module
 
 /-- True if `name` is defined in a project module (one whose name has `rootPrefix` as a prefix).
 This is keyed on the declaration's *module*, not its name: a project's declaration names need not
@@ -488,19 +494,47 @@ lost: this is a `partial` definition, so importers cannot unfold it either way. 
   | (``Lean.Name.str, #[p, s]) => some (.str (← evalNameExpr? p) (← exprStrLit? s))
   | _ => none
 
-/-- Every `Name` value embedded anywhere in `e` (reconstructed via `evalNameExpr?`). -/
-def collectEmbeddedNames (e : Expr) : Array Name := Id.run do
-  let mut acc : Array Name := #[]
-  if let some n := evalNameExpr? e then acc := acc.push n
-  match e with
-  | .app f a => return acc ++ collectEmbeddedNames f ++ collectEmbeddedNames a
-  | .lam _ t b _ => return acc ++ collectEmbeddedNames t ++ collectEmbeddedNames b
-  | .forallE _ t b _ => return acc ++ collectEmbeddedNames t ++ collectEmbeddedNames b
-  | .letE _ t v b _ =>
-    return acc ++ collectEmbeddedNames t ++ collectEmbeddedNames v ++ collectEmbeddedNames b
-  | .mdata _ b => return acc ++ collectEmbeddedNames b
-  | .proj _ _ b => return acc ++ collectEmbeddedNames b
-  | _ => return acc
+/-- Every `Name` value embedded anywhere in `e` (reconstructed via `evalNameExpr?`), in pre-order.
+
+The walk memoizes on the `Expr` nodes, as `projStructureNames` does: a subterm shared by several
+parents is walked once. A plain tree walk visits a shared subterm once per path to it, which is
+exponential in the depth of sharing, and the values of large definitions share a great deal (on Tau
+Ceti, one such value kept `notationExpansionDeps` busy for more than 18 minutes). Skipping a
+subterm already walked only drops repetitions of names already collected, so the names come out in
+the same order of first occurrence as a tree walk would give, each at most as often. -/
+def collectEmbeddedNames (e : Expr) : Array Name :=
+  (go e (#[], {})).1
+where
+  go (e : Expr) (st : Array Name × Std.HashSet Expr) : Array Name × Std.HashSet Expr :=
+    let (acc, seen) := st
+    if seen.contains e then
+      st
+    else
+      let acc := match evalNameExpr? e with
+        | some n => acc.push n
+        | none => acc
+      let (acc, seen) :=
+        match e with
+        | .app f a => go a (go f (acc, seen))
+        | .lam _ t b _ => go b (go t (acc, seen))
+        | .forallE _ t b _ => go b (go t (acc, seen))
+        | .letE _ t v b _ => go b (go v (go t (acc, seen)))
+        | .mdata _ b => go b (acc, seen)
+        | .proj _ _ b => go b (acc, seen)
+        | _ => (acc, seen)
+      (acc, seen.insert e)
+
+/-- The constants from which `evalNameExpr?` reconstructs a `Name`. -/
+def nameBuilders : Array Name :=
+  #[``Lean.Name.anonymous, ``Lean.Name.str, ``Lean.Name.mkStr1, ``Lean.Name.mkStr2,
+    ``Lean.Name.mkStr3, ``Lean.Name.mkStr4]
+
+/-- Whether `e` mentions one of `nameBuilders`, that is, whether it can embed a `Name` at all.
+`Expr.find?` visits each shared subterm once, so this is cheap even on large values. -/
+def buildsName (e : Expr) : Bool :=
+  (e.find? fun
+    | .const n _ => nameBuilders.contains n
+    | _ => false).isSome
 
 /-- True if `n` names a notation/syntax parser (its type is `Lean.ParserDescr`/`TrailingParserDescr`). -/
 def isNotationKind (env : Environment) (n : Name) : Bool :=
@@ -518,6 +552,8 @@ def notationExpansionDeps (env : Environment) (projectConsts : Array (Name × Na
   let mut m : Std.HashMap Name (Array Name) := {}
   for (_, _, cinfo) in projectConsts do
     if let .defnInfo v := cinfo then
+      -- Most values build no `Name`, and so embed none: `buildsName` rules them out cheaply.
+      unless buildsName v.value do continue
       let names := (collectEmbeddedNames v.value).filter (env.contains ·)
       let kinds := names.filter (isNotationKind env ·)
       unless kinds.isEmpty do
@@ -646,6 +682,20 @@ structure DeclDeps where
   dataDeps : Array Name
 deriving Repr, Inhabited
 
+/-- Which of `DeclDeps`' lists to compute. A list not asked for is left empty.
+
+`deps` is most of the cost: it walks the whole value, every proof term included, while `typeDeps`
+walks the statement and `dataDeps` skips the proofs inside a value when the `Context` has data values
+for it. A caller that only needs what declarations *mean* asks for `{ deps := false }`. -/
+structure DepsRequest where
+  /-- Compute `DeclDeps.deps`. -/
+  deps : Bool := true
+  /-- Compute `DeclDeps.dataDeps`. For a declaration without a data value in the `Context` (a
+  theorem, or any declaration when `withDataValueConsts` was not run), `dataDeps` is `deps`, and so
+  walks the whole value even when `deps` itself is not asked for. -/
+  dataDeps : Bool := true
+deriving Repr, Inhabited
+
 /-- The project-wide tables the per-declaration analysis needs, computed once by `Context.of` and
 reused for every declaration. -/
 structure Context where
@@ -720,9 +770,9 @@ def Context.of (env : Environment) (rootPrefix : Name) : Context :=
 
 /-- The dependencies of the single declaration `name` (whose `ConstantInfo` is `info`), threading
 the memo `cache` used by `expandThroughInternals`; the updated cache is returned alongside and
-should be passed to the next call. -/
-def Context.declDeps (ctx : Context) (cache : Cache) (name : Name) (info : ConstantInfo) :
-    DeclDeps × Cache :=
+should be passed to the next call. `request` says which lists to compute (all by default). -/
+def Context.declDeps (ctx : Context) (cache : Cache) (name : Name) (info : ConstantInfo)
+    (request : DepsRequest := {}) : DeclDeps × Cache :=
   -- Adds, for every referenced type with coercion instances, those instances (see `coercionClasses`),
   -- but only the ones whose coerced-from type this declaration actually mentions in full: the head
   -- constant on its own is far too coarse a match (see `coercionInstancesByType`).
@@ -736,24 +786,32 @@ def Context.declDeps (ctx : Context) (cache : Cache) (name : Name) (info : Const
   -- stored as `Name` data inside its macro and so invisible to `getUsedConstants`); see
   -- `notationExpansionDeps`. The reverse direction (a declaration whose *source* uses a notation)
   -- is syntactic, and so is left to callers that have the source syntax at hand.
+  -- The value walk, proofs included, only when a requested list needs it: for a theorem it is the
+  -- whole proof term, most of the cost of the analysis.
+  let dataValue? := ctx.dataValueConsts.get? name
+  let needAll := request.deps || (request.dataDeps && dataValue?.isNone)
   let allUsedConstants :=
-    addCoercionInsts (usedConstantsOf ctx.env name info true ++ ctx.notationDeps.getD name #[])
+    if needAll then
+      addCoercionInsts (usedConstantsOf ctx.env name info true ++ ctx.notationDeps.getD name #[])
+    else #[]
   -- The same inputs as `allUsedConstants`, with the value's contribution replaced by its
   -- proof-skipped form where one was computed. Everything downstream — coercion instances,
   -- expansion through internal helpers, the visibility filter — is applied identically, so the
   -- result is comparable to `deps` edge for edge.
   let dataUsedConstants :=
-    match ctx.dataValueConsts.get? name with
+    match dataValue? with
     | some valueConsts =>
-      addCoercionInsts (usedConstantsOf ctx.env name info false ++ valueConsts
-        ++ ctx.notationDeps.getD name #[])
+      if request.dataDeps then
+        addCoercionInsts (usedConstantsOf ctx.env name info false ++ valueConsts
+          ++ ctx.notationDeps.getD name #[])
+      else #[]
     | none => allUsedConstants
-  let (typeExpanded, cache) :=
-    expandThroughInternals ctx.env ctx.rootPrefix ctx.exposed cache typeUsedConstants
-  let (allExpanded, cache) :=
-    expandThroughInternals ctx.env ctx.rootPrefix ctx.exposed cache allUsedConstants
-  let (dataExpanded, cache) :=
-    expandThroughInternals ctx.env ctx.rootPrefix ctx.exposed cache dataUsedConstants
+  let expand (cache : Cache) (wanted : Bool) (cs : Array Name) : Array Name × Cache :=
+    if wanted then expandThroughInternals ctx.env ctx.rootPrefix ctx.exposed cache cs
+    else (#[], cache)
+  let (typeExpanded, cache) := expand cache true typeUsedConstants
+  let (allExpanded, cache) := expand cache request.deps allUsedConstants
+  let (dataExpanded, cache) := expand cache request.dataDeps dataUsedConstants
   -- A declaration can only reference what its own module can see. Any project-local dependency in
   -- a module this one does not import is impossible, so it is an artifact of the analysis (a
   -- too-eagerly replayed coercion instance, say) rather than a real edge. Constants outside the
@@ -764,38 +822,59 @@ def Context.declDeps (ctx : Context) (cache : Cache) (name : Name) (info : Const
     match ctx.declModule.get? dep with
     | none => true
     | some mod => visible.contains mod
-  let dedup (cs : Array Name) : Array Name :=
-    cs.foldl (fun acc dep =>
-      if dep != name && importable dep && !acc.contains dep then acc.push dep else acc) #[]
+  -- First occurrences, in order. A hash set rather than `Array.contains`, which made this quadratic
+  -- in the length of the list.
+  let dedup (cs : Array Name) : Array Name := Id.run do
+    let mut seen : Std.HashSet Name := {}
+    let mut out := #[]
+    for dep in cs do
+      if dep == name || seen.contains dep then continue
+      seen := seen.insert dep
+      if importable dep then out := out.push dep
+    return out
   ({ typeDeps := dedup typeExpanded, deps := dedup allExpanded, dataDeps := dedup dataExpanded },
     cache)
 
 /-- Fills `Context.dataValueConsts` for every exposed `.defnInfo`, so that `declDeps` can report
-`DeclDeps.dataDeps`.
+`DeclDeps.dataDeps`; with `only`, for those of them in `only`.
 
 Restricted to `.defnInfo` because that is where the excess is: `def` and `instance` account for
 essentially all of the gap between `typeDeps` and `deps` (on `BrownianMotion`, 6709 of 6711 edges),
 while `structure`, `inductive` and `typeclass` show none. That also keeps the cost proportional to a
 small minority of declarations — 263 of 1692 there — rather than to the whole project. -/
-def Context.withDataValueConsts (ctx : Context) : MetaM Context := do
+def Context.withDataValueConsts (ctx : Context) (only : Option (Std.HashSet Name) := none) :
+    MetaM Context := do
   let mut consts : Std.HashMap Name (Array Name) := {}
   for (name, _, info) in ctx.constants do
-    if ctx.exposed.contains name then
+    if ctx.exposed.contains name && only.all (·.contains name) then
       if info matches .defnInfo _ then
         consts := consts.insert name (← dataValueConstants info)
   return { ctx with dataValueConsts := consts }
 
-/-- The dependencies of every exposed declaration of the project, in environment order, sharing one
-expansion cache. -/
-def Context.allDeclDeps (ctx : Context) : Array (Name × DeclDeps) := Id.run do
-  let mut cache : Cache := {}
-  let mut out : Array (Name × DeclDeps) := #[]
-  for (name, _, info) in ctx.constants do
-    if ctx.exposed.contains name then
-      let (deps, cache') := ctx.declDeps cache name info
-      cache := cache'
-      out := out.push (name, deps)
-  return out
+/-- The dependencies of each of `targets`, in the order of `targets`: the same as calling
+`declDeps` on each in turn, but in parallel. The targets are split into chunks of `chunk`
+declarations, each processed by its own task with its own expansion cache; the cache is only a memo,
+so the result does not depend on the chunking. -/
+def Context.depsOf (ctx : Context) (targets : Array (Name × ConstantInfo))
+    (request : DepsRequest := {}) (chunk : Nat := 256) : Array (Name × DeclDeps) :=
+  let chunk := max chunk 1
+  let tasks := (Array.range ((targets.size + chunk - 1) / chunk)).map fun i =>
+    let part := targets.extract (i * chunk) ((i + 1) * chunk)
+    Task.spawn fun _ => Id.run do
+      let mut cache : Cache := {}
+      let mut out : Array (Name × DeclDeps) := #[]
+      for (name, info) in part do
+        let (deps, cache') := ctx.declDeps cache name info request
+        cache := cache'
+        out := out.push (name, deps)
+      return out
+  tasks.foldl (fun acc t => acc ++ t.get) #[]
+
+/-- The dependencies of every exposed declaration of the project, in environment order
+(`Context.depsOf`, in parallel). -/
+def Context.allDeclDeps (ctx : Context) (request : DepsRequest := {}) : Array (Name × DeclDeps) :=
+  ctx.depsOf (ctx.constants.filterMap fun (name, _, info) =>
+    if ctx.exposed.contains name then some (name, info) else none) request
 
 /-- One-shot entry point: the dependencies of every declaration the project rooted at `rootPrefix`
 declares itself. -/
