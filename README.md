@@ -130,9 +130,11 @@ code on that toolchain (`lean-v4.34.0`, for Tau Ceti).
 
 ## Performance
 
-On Tau Ceti (a quarter of the library at a time, 63,000 project constants over 9,600 imported
-modules), `Context.of` takes a few seconds, and the dependencies of 20,000 declarations are computed
-in parallel. Three things made the difference, each checked to change no result:
+On a quarter of Tau Ceti (63,486 project constants over 9,631 imported modules, of which 20,129
+declarations to analyse), `Context.of` takes 0.3 s and the dependencies take 0.6 s. Before, the
+same took 33 s and 51 s, and on one commit the notation walk alone did not finish in 18 minutes.
+Three things made the difference, each checked to change no result (the LeanTrustBuilders extractor
+writes byte-identical datasets of Tau Ceti with the old and the new code):
 
 - `moduleNameOf` indexes `env.header.modules` directly. `env.header.moduleNames` rebuilds the array
   of every module's name on each call, about 170 µs on such an environment against 50 ns for the
