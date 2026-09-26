@@ -59,12 +59,13 @@ This is what bounds the analysis: helper constants are expanded *through* (their
 pulled in instead of the helper), and everything outside the project is left alone.
 -/
 
-/-- True if `s` is `pfx` followed by a non-empty sequence of digits, the naming convention used
-by the compiler for auto-generated declarations like `match_1`, `eq_2`, `hcongr_11`. -/
+/-- True if `s` is `pfx` followed by a digit and then digits and underscores, the naming
+convention used by the compiler for auto-generated declarations like `match_1`, `eq_2`,
+`hcongr_11`, and `match_1_1` (a second matcher of that name, inside a private declaration). -/
 def isPrefixWithDigitSuffix (pfx s : String) : Bool :=
   s.startsWith pfx &&
-    let rest := s.drop pfx.length
-    !rest.isEmpty && rest.toString.toList.all Char.isDigit
+    let rest := (s.drop pfx.length).toString.toList
+    rest.head?.any Char.isDigit && rest.all fun c => c.isDigit || c == '_'
 
 /-- True if `s` is a single name component the compiler generates: anything underscore-led
 (`_hyg`, `_proof_3`, `_private`, ...), a `match_<n>`/`eq_<n>`/`hcongr_<n>` helper, or the
@@ -166,13 +167,26 @@ def isAuthored (env : Environment) (name : Name) (info : ConstantInfo) : Bool :=
     false
   else if isInternalName name || name.isInternal || name.isImplementationDetail then
     false
-  else if isAuxRecursor env name || isNoConfusion env name then
+  else if isAuxRecursor env name || isNoConfusion env name || Meta.isMatcherCore env name then
     false
   else if hasConstructorPrefix env name then
     false
   else match info with
     | .ctorInfo _ | .recInfo _ | .quotInfo _ => false
     | _ => true
+
+/-- Whether a declaration is one a person wrote, private or not: `isAuthored`, except that a private
+declaration counts. `isAuthored` reads the `_private` prefix of a private name as the mark of a
+helper; here the name is read without it. The suite's rule for which constants are declarations
+(`Display.declared`, `MeaningGraph.Hash.Rule.meaning`). -/
+def isDeclaration (env : Environment) (n : Name) (info : ConstantInfo) : Bool :=
+  if isPrivateName n then
+    let u := privateToUserName n
+    !env.isProjectionFn n && !(isInternalName u || u.isInternal || u.isImplementationDetail)
+      && !isAuxRecursor env n && !isNoConfusion env n && !Meta.isMatcherCore env n
+      && !hasConstructorPrefix env n
+      && !(info matches .ctorInfo _ | .recInfo _ | .quotInfo _)
+  else isAuthored env n info
 
 /-- Decides whether a declaration is one the project's author actually wrote, as opposed to
 compiler output (recursors, projections, constructor companions, hygienic helpers, ...) or a
@@ -216,6 +230,8 @@ inductive Display where
   | authored
   /-- Those Lean offers for completion (`isCompletionVisible`): trust's rule. -/
   | completion
+  /-- Those a person wrote, private ones included (`isDeclaration`): the suite's rule. -/
+  | declared
 deriving Repr, BEq, Inhabited
 
 /-- Whether `name` is a declaration under `display`. -/
@@ -224,6 +240,7 @@ def Display.accepts (display : Display) (env : Environment) (name : Name) (info 
   match display with
   | .authored => isAuthored env name info
   | .completion => isCompletionVisible env name
+  | .declared => isDeclaration env name info
 
 /-- How a `Context` analyses. -/
 structure Options where
@@ -928,6 +945,36 @@ def Context.declDeps (ctx : Context) (cache : Cache) (name : Name) (info : Const
     return out
   ({ typeDeps := dedup typeExpanded, deps := dedup allExpanded, dataDeps := dedup dataExpanded },
     cache)
+
+/-- What the declaration's *source* needs that its elaborated term does not mention: the coercion
+instances whose coerced-from type the declaration mentions in full (anywhere, proofs included), and,
+for a notation, the constants it expands to. Expanded through helpers, deduplicated and filtered by
+visibility like `declDeps`' lists; the updated cache is returned alongside.
+
+These are the `source` dependencies: what a standalone file must bring along to elaborate. They are
+not part of a declaration's meaning, which is what its elaborated term says (`MeaningGraph.Hash`). -/
+def Context.sourceDeps (ctx : Context) (cache : Cache) (name : Name) (info : ConstantInfo) :
+    Array Name × Cache :=
+  let used := usedConstantsOf ctx.env name info true
+  let present : Std.HashSet Name := used.foldl (fun acc c => acc.insert c) {}
+  let coercions := used.foldl (init := #[]) fun acc c =>
+    acc ++ (ctx.coercionInstances.getD c #[]).filterMap fun inst =>
+      if inst.witnesses.all present.contains then some inst.name else none
+  let (expanded, cache) :=
+    expandThrough ctx.env (!ctx.stopsAt ·) cache (coercions ++ ctx.notationDeps.getD name #[])
+  let visible := ctx.visibleModules.getD (ctx.declModule.getD name .anonymous) {}
+  let out := Id.run do
+    let mut seen : Std.HashSet Name := {}
+    let mut out := #[]
+    for dep in expanded do
+      if dep == name || seen.contains dep then continue
+      seen := seen.insert dep
+      let importable := match ctx.declModule.get? dep with
+        | none => true
+        | some mod => visible.contains mod
+      if importable then out := out.push dep
+    return out
+  (out, cache)
 
 /-- Fills `Context.dataValueConsts` for every exposed `.defnInfo`, so that `declDeps` can report
 `DeclDeps.dataDeps`; with `only`, for those of them in `only`.

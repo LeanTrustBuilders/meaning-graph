@@ -133,6 +133,38 @@ On LeanMachineLearning (1,452 declarations, on Mathlib), the closure of the whol
 Under `.none`, the notation and coercion recoveries still come from the project's own declarations,
 whose source is what they serve. An upstream declaration is analysed from its elaborated term only.
 
+### One rule for the graph and the hash: `MeaningGraph.Hash`
+
+`import MeaningGraph.Hash` gives what a declaration's *meaning* rests on, and a hash of that meaning,
+from one walk under one rule (`ltb-meaning/1`), so that the two agree by construction:
+
+- **Proofs are erased everywhere** — in types, values and helpers: an argument whose expected type
+  (read off the type of the function applied) is a proposition, or a let-bound value whose type is
+  one, becomes a marker. A declaration whose type is a proposition means its statement.
+- **Content**: a definition's type and erased value; a theorem's, axiom's or opaque constant's type;
+  an inductive type with its mutual block and constructors. A constructor or recursor is a reference
+  to its block.
+- **Declarations** are those a person wrote, private ones included (`isDeclaration`, and
+  `Display.declared` for `Context`); the rule is a parameter (`Rule.isNode`). Everything else is a
+  helper, looked through.
+- **The meaning hash** is a Merkle hash: a constant's content with each reference replaced by the
+  referenced constant's meaning hash. The kernel only lets a constant refer to earlier constants or
+  its own block, so this is well founded. It is deep (it covers everything underneath, Lean core
+  included) and does not depend on names, binder names or binder kinds, or on which constants are
+  declarations.
+- **Edges** (`Walk.targets`) go to the declarations a content mentions, looking through helpers.
+- **The local hash** (`Walk.localHash`) is the same content with references to other declarations
+  by name: it changes when the declaration itself is rewritten.
+
+A declaration's meaning hash therefore changes exactly when something in its closure along the
+edges changes (up to 64-bit collisions). `MeaningGraph.TestHash` checks it on two versions of a small
+library side by side: the declarations whose hash moves are exactly those whose closure reaches the
+changed one, and changing only proofs or binder names moves nothing. On LeanMachineLearning (1,468
+declarations on Mathlib) the walk reaches 12,336 blocks and takes 2 seconds.
+
+`Context.sourceDeps` gives, separately, what a declaration's *source* needs besides its meaning:
+coercion instances and notation.
+
 ### Graph passes
 
 `reverseDeps` (who uses this) and `transitiveDeps` / `topologicalClosure` (everything this reaches,
@@ -198,7 +230,9 @@ running them:
   that only a walk visiting each subterm once gets through; and, in `MeaningGraph.TestOptions`, that
   the default options look through exactly what `expandThroughInternals` does, that past the
   project every dependency is a declaration, which constants each display rule accepts, and how
-  the closures nest.
+  the closures nest; and, in `MeaningGraph.TestHash`, the meaning hash: proofs, binder names and
+  constant names left out, proofs inside statements and `Prop` instances erased, private
+  declarations as declarations, and a change moving exactly the hashes of what rests on it.
 - `lake build MeaningGraphProofs` — theorems about the project boundary (`hasPrefixName` is a
   component-wise prefix order; `isInternalName` is inherited downwards) and about
   `topologicalClosure`, which is total rather than `partial`.
