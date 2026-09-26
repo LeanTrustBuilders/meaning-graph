@@ -211,4 +211,23 @@ def localOf (n : Name) : MetaM UInt64 := do
   return ((w.localHash {} ``V1.uses).1 == (w'.localHash {} ``V1.uses).1,
     (w.meaning? ``V1.uses) == (w.meaning? ``V2.uses))
 
+/-! ## Linear in the distinct subterms
+
+An expression can share subterms so much that it is a tree of 10⁸ nodes on a few hundred (Tau Ceti's
+F4 root system). Here, `Nat.add x x` nested 64 times on one shared `x`: 2⁶⁴ nodes as a tree, 65 as
+a graph. Erasing and hashing it only finish if both are memoised. -/
+
+/-- `Nat.add x x`, nested `n` times on one shared `x`. -/
+def doubling : Nat → Expr
+  | 0 => mkConst ``Nat.zero
+  | n + 1 => let x := doubling n; mkApp2 (mkConst ``Nat.add) x x
+
+/-- info: (true, true) -/
+#guard_msgs in
+#eval show MetaM _ from do
+  let e := doubling 64
+  let h : UInt64 := Id.run ((hashExpr [] (fun _ => 7) e).run' {})
+  let e' ← (erase e).run' {}
+  return (h != 0, e' == e)
+
 end MeaningGraph.TestHash
