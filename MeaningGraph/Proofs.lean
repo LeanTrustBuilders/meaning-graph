@@ -40,7 +40,7 @@ same function written so Lean can see the recursion.
 
 `topologicalClosure` was `partial` for a real reason — its termination argument is about a visited
 set that grows — and is now total via an explicit fuel bound; see the section on it below. What is
-still `partial` in `MeaningGraph` is `expandThroughInternals`, a worklist with the same shape of
+still `partial` in `MeaningGraph` is `expandThrough`, a worklist with the same shape of
 argument, and `evalNameExpr?`, whose recursion goes through `Expr.getAppFnArgs` rather than a
 constructor.
 

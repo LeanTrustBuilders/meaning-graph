@@ -19,7 +19,7 @@ name = "MeaningGraph"
 # `Test.Foo` resolved to *this* package and the consumer's test build failed with "no such file".
 [[lean_lib]]
 name = "MeaningGraphTest"
-roots = ["MeaningGraph.Test", "MeaningGraph.TestEquivalence"]
+roots = ["MeaningGraph.Test", "MeaningGraph.TestEquivalence", "MeaningGraph.TestOptions"]
 
 [[lean_lib]]
 name = "MeaningGraphProofs"

@@ -158,29 +158,78 @@ share the root module prefix (e.g. module `LeanMachineLearning.…` declaring `B
 def isProjectLocalConst (env : Environment) (rootPrefix : Name) (name : Name) : Bool :=
   (moduleNameOf env name).any (hasPrefixName · rootPrefix)
 
+/-- Whether a declaration is one a person wrote, as opposed to compiler output: not a recursor,
+projection, constructor or constructor companion, `noConfusion`, hygienic or otherwise internal
+helper. Says nothing about where the declaration comes from; `shouldExpose` adds that. -/
+def isAuthored (env : Environment) (name : Name) (info : ConstantInfo) : Bool :=
+  if env.isProjectionFn name then
+    false
+  else if isInternalName name || name.isInternal || name.isImplementationDetail then
+    false
+  else if isAuxRecursor env name || isNoConfusion env name then
+    false
+  else if hasConstructorPrefix env name then
+    false
+  else match info with
+    | .ctorInfo _ | .recInfo _ | .quotInfo _ => false
+    | _ => true
+
 /-- Decides whether a declaration is one the project's author actually wrote, as opposed to
 compiler output (recursors, projections, constructor companions, hygienic helpers, ...) or a
 declaration from outside the project. This is both the set a consumer would display and the
 boundary at which dependency expansion stops (see `expandThroughInternals`). -/
 def shouldExpose (env : Environment) (rootPrefix : Name) (name : Name) (info : ConstantInfo) : Bool :=
-  if let some moduleName := moduleNameOf env name then
-    if !hasPrefixName moduleName rootPrefix then
-      false
-    else if env.isProjectionFn name then
-      false
-    else if isInternalName name || name.isInternal || name.isImplementationDetail then
-      false
-    else if isAuxRecursor env name || isNoConfusion env name then
-      false
-    else if hasConstructorPrefix env name then
-      false
-    else match info with
-      | .ctorInfo _ | .recInfo _ | .quotInfo _ => false
-      | _ => true
-  else if env.isProjectionFn name then
-    false
-  else
-    false
+  isProjectLocalConst env rootPrefix name && isAuthored env name info
+
+/-- Whether Lean offers `name` for completion, and it is not an internal detail: the rule
+[aftk](https://github.com/mathlib-initiative/aftk)'s `shouldDisplay` states, which
+[trust](https://github.com/chrisflav/trust) draws its graphs with. Unlike `isAuthored`, it keeps
+constructors, projections, `Quot` primitives and the lemmas Lean generates under ordinary names
+(`eq_1`, `eq_def`, `injEq`, `ext_iff`, …). -/
+def isCompletionVisible (env : Environment) (name : Name) : Bool :=
+  Lean.Meta.allowCompletion env name && !(privateToUserName name).isInternalDetail
+
+/-! ## Options: where the analysis stops, and which constants are declarations
+
+The defaults are this module's own choices: a project's analysis stops at the project, and the
+declarations are those a person wrote. Other tools draw their graphs differently —
+[trust](https://github.com/chrisflav/trust) follows dependencies into the libraries underneath and
+counts every constant completion offers — and `Options` lets a caller have those choices without
+another dependency computation.
+-/
+
+/-- Where the analysis stops. -/
+inductive Boundary where
+  /-- At the project. A constant from outside it is a leaf, reported as itself, and only the
+  project's own helpers are looked through. -/
+  | project
+  /-- Nowhere. An upstream declaration can be analysed as a project one is (`Context.declDeps`
+  accepts it), helpers are looked through wherever they come from, and `Context.closure` follows
+  dependencies into the libraries underneath. -/
+  | none
+deriving Repr, BEq, Inhabited
+
+/-- Which constants are declarations in their own right: nodes of the graph, and where looking
+through helpers stops. Every other constant is looked through. -/
+inductive Display where
+  /-- Those a person wrote (`isAuthored`). -/
+  | authored
+  /-- Those Lean offers for completion (`isCompletionVisible`): trust's rule. -/
+  | completion
+deriving Repr, BEq, Inhabited
+
+/-- Whether `name` is a declaration under `display`. -/
+def Display.accepts (display : Display) (env : Environment) (name : Name) (info : ConstantInfo) :
+    Bool :=
+  match display with
+  | .authored => isAuthored env name info
+  | .completion => isCompletionVisible env name
+
+/-- How a `Context` analyses. -/
+structure Options where
+  boundary : Boundary := .project
+  display : Display := .authored
+deriving Repr, Inhabited
 
 /-- All constants belonging to modules whose name has `rootPrefix`, paired with their module
 name, gathered directly from `env.header.moduleData` so that the (typically much larger) set of
@@ -465,6 +514,21 @@ Not `@[expose]`, for the same reason as `evalNameExpr?`: the body refers to the 
     return st.acc
   | _ => return #[]
 
+/-- `dataValueConstants` of each of `infos`, sharing the parameter masks (`constPropMask`) between
+them: many declarations apply the same constants, and a mask costs a telescope of the constant's
+type. -/
+@[no_expose] def dataValueConstantsOf (infos : Array ConstantInfo) : MetaM (Array (Array Name)) := do
+  let mut masks : Std.HashMap Name (Array Bool) := {}
+  let mut out := #[]
+  for info in infos do
+    match info with
+    | .defnInfo val =>
+      let (_, st) ← (dataWalkGo val.value).run { masks }
+      masks := st.masks
+      out := out.push st.acc
+    | _ => out := out.push #[]
+  return out
+
 /-! ## Dependencies the elaborated term does not mention: notation -/
 
 /-- The `String` a string-literal `Expr` holds, if `e` is one. -/
@@ -627,18 +691,14 @@ def coercionInstancesByType (env : Environment) (rootPrefix : Name) (exposed : S
 one run (see `expandThroughInternals`). -/
 abbrev Cache := Std.HashMap Name (Array Name)
 
-/-- Expands `start` by following constants that are project-local (share `rootPrefix`) but are
-not themselves exposed declarations — i.e. compiler-generated helpers such as `_proof_N`,
-`match_..`, or structure field-default functions — recursively pulling in whatever *they* depend
-on instead of stopping at their (uninformative) name. Exposed declarations and external
-(non-project) constants are kept as-is without further expansion.
+/-- Expands `start` by looking through every constant `isHelper` accepts: such a constant is
+replaced by what it uses (`usedConstantsOf`, value included), recursively, and every other constant
+is kept as it is. `cache` memoizes the one-level expansion of helpers across calls.
 
 This mirrors the recursive dependency-collection idea from
-https://github.com/mattrobball/lean-informal/blob/main/Informal/Deps.lean, bounded to the
-project's own constants so it doesn't walk into upstream library internals. `cache` memoizes the
-one-level expansion of internal helpers across declarations. -/
-partial def expandThroughInternals (env : Environment) (rootPrefix : Name)
-    (exposed : Std.HashSet Name) (cache : Cache) (start : Array Name) : Array Name × Cache :=
+https://github.com/mattrobball/lean-informal/blob/main/Informal/Deps.lean. -/
+partial def expandThrough (env : Environment) (isHelper : Name → Bool) (cache : Cache)
+    (start : Array Name) : Array Name × Cache :=
   go cache {} #[] start.toList
 where
   go (cache : Cache) (visited : Std.HashSet Name) (acc : Array Name) :
@@ -649,8 +709,7 @@ where
         go cache visited acc rest
       else
         let visited := visited.insert n
-        let isInternalHelper := !exposed.contains n && isProjectLocalConst env rootPrefix n
-        if !isInternalHelper then
+        if !isHelper n then
           go cache visited (acc.push n) rest
         else
           match cache.get? n with
@@ -661,6 +720,16 @@ where
             | some info =>
               let deps := usedConstantsOf env n info true
               go (cache.insert n deps) visited acc (rest ++ deps.toList)
+
+/-- Expands `start` by following constants that are project-local (share `rootPrefix`) but are
+not themselves exposed declarations — i.e. compiler-generated helpers such as `_proof_N`,
+`match_..`, or structure field-default functions — recursively pulling in whatever *they* depend
+on instead of stopping at their (uninformative) name. Exposed declarations and external
+(non-project) constants are kept as-is without further expansion: `expandThrough` with the project
+boundary, which is what `Context.declDeps` does under the default `Options`. -/
+def expandThroughInternals (env : Environment) (rootPrefix : Name)
+    (exposed : Std.HashSet Name) (cache : Cache) (start : Array Name) : Array Name × Cache :=
+  expandThrough env (fun n => !exposed.contains n && isProjectLocalConst env rootPrefix n) cache start
 
 /-! ## Per-declaration dependencies -/
 
@@ -700,12 +769,15 @@ deriving Repr, Inhabited
 reused for every declaration. -/
 structure Context where
   env : Environment
+  /-- Where the analysis stops, and which constants are declarations. -/
+  options : Options := {}
   /-- Root module prefix delimiting the project: a constant counts as project-local when the module
   declaring it has this prefix (see `isProjectLocalConst`). -/
   rootPrefix : Name
   /-- Every constant declared by a project module, as `(name, module, info)`. -/
   constants : Array (Name × Name × ConstantInfo)
-  /-- The project's user-written declarations (`shouldExpose`); expansion stops at these. -/
+  /-- The project's declarations, under `options.display` (by default those a person wrote:
+  `shouldExpose`); expansion stops at these. -/
   exposed : Std.HashSet Name
   /-- Notation kind ↦ constants its expansion references (`notationExpansionDeps`). -/
   notationDeps : Std.HashMap Name (Array Name)
@@ -753,13 +825,18 @@ def visibleProjectModules (env : Environment) (rootPrefix : Name) :
 
 /-- Scans `env` for the project rooted at `rootPrefix` and builds the tables `Context.declDeps`
 needs. Does the whole-environment work once, so a caller analysing many declarations should build
-this a single time. -/
-def Context.of (env : Environment) (rootPrefix : Name) : Context :=
+this a single time.
+
+The tables are the project's under any `options`: notation and coercion instances are recovered for
+the project's own declarations, whose source is what they serve, and with `Boundary.none` an
+upstream declaration is analysed from its elaborated term alone. -/
+def Context.of (env : Environment) (rootPrefix : Name) (options : Options := {}) : Context :=
   let constants := projectConstants env rootPrefix
   let exposed : Std.HashSet Name :=
     constants.foldl (fun acc (name, _, info) =>
-      if shouldExpose env rootPrefix name info then acc.insert name else acc) {}
+      if options.display.accepts env name info then acc.insert name else acc) {}
   { env := env
+    options := options
     rootPrefix := rootPrefix
     constants := constants
     exposed := exposed
@@ -768,9 +845,26 @@ def Context.of (env : Environment) (rootPrefix : Name) : Context :=
     declModule := constants.foldl (fun acc (name, mod, _) => acc.insert name mod) {}
     visibleModules := visibleProjectModules env rootPrefix }
 
+/-- Whether expansion stops at `n`, which is then a node of the graph, rather than looking through
+it. A project constant is a node when it is one of the project's declarations (`exposed`). Past the
+project, under `Boundary.project` every constant is a leaf, and under `Boundary.none` a constant is a
+node when it is a declaration under `options.display`, and is looked through otherwise. -/
+def Context.stopsAt (ctx : Context) (n : Name) : Bool :=
+  if ctx.declModule.contains n then
+    ctx.exposed.contains n
+  else match ctx.options.boundary with
+    | .project => true
+    | .none =>
+      match ctx.env.find? n with
+      | some info => ctx.options.display.accepts ctx.env n info
+      | none => true
+
 /-- The dependencies of the single declaration `name` (whose `ConstantInfo` is `info`), threading
-the memo `cache` used by `expandThroughInternals`; the updated cache is returned alongside and
-should be passed to the next call. `request` says which lists to compute (all by default). -/
+the memo `cache` used by `expandThrough`; the updated cache is returned alongside and
+should be passed to the next call. `request` says which lists to compute (all by default).
+
+`name` is normally one of the project's declarations. Under `Boundary.none` it can be any
+declaration of the environment. -/
 def Context.declDeps (ctx : Context) (cache : Cache) (name : Name) (info : ConstantInfo)
     (request : DepsRequest := {}) : DeclDeps × Cache :=
   -- Adds, for every referenced type with coercion instances, those instances (see `coercionClasses`),
@@ -807,7 +901,7 @@ def Context.declDeps (ctx : Context) (cache : Cache) (name : Name) (info : Const
       else #[]
     | none => allUsedConstants
   let expand (cache : Cache) (wanted : Bool) (cs : Array Name) : Array Name × Cache :=
-    if wanted then expandThroughInternals ctx.env ctx.rootPrefix ctx.exposed cache cs
+    if wanted then expandThrough ctx.env (!ctx.stopsAt ·) cache cs
     else (#[], cache)
   let (typeExpanded, cache) := expand cache true typeUsedConstants
   let (allExpanded, cache) := expand cache request.deps allUsedConstants
@@ -851,6 +945,18 @@ def Context.withDataValueConsts (ctx : Context) (only : Option (Std.HashSet Name
         consts := consts.insert name (← dataValueConstants info)
   return { ctx with dataValueConsts := consts }
 
+/-- Adds to `Context.dataValueConsts` the data values of those of `names` that are definitions and
+have none yet, wherever they come from: what `Context.closure` needs past the project. -/
+def Context.withDataValuesFor (ctx : Context) (names : Array Name) : MetaM Context := do
+  let todo := names.filterMap fun n =>
+    if ctx.dataValueConsts.contains n then none
+    else match ctx.env.find? n with
+      | some info@(.defnInfo _) => some (n, info)
+      | _ => none
+  let values ← dataValueConstantsOf (todo.map (·.2))
+  let consts := (todo.zip values).foldl (fun m ((n, _), v) => m.insert n v) ctx.dataValueConsts
+  return { ctx with dataValueConsts := consts }
+
 /-- The dependencies of each of `targets`, in the order of `targets`: the same as calling
 `declDeps` on each in turn, but in parallel. The targets are split into chunks of `chunk`
 declarations, each processed by its own task with its own expansion cache; the cache is only a memo,
@@ -875,6 +981,92 @@ def Context.depsOf (ctx : Context) (targets : Array (Name × ConstantInfo))
 def Context.allDeclDeps (ctx : Context) (request : DepsRequest := {}) : Array (Name × DeclDeps) :=
   ctx.depsOf (ctx.constants.filterMap fun (name, _, info) =>
     if ctx.exposed.contains name then some (name, info) else none) request
+
+/-! ## Closures past the project -/
+
+/-- What `Context.closure` follows out of a declaration it reaches. A proof contributes its
+statement under every rule: what a theorem rests on is what it states, not what its proof happened
+to call. -/
+inductive Follow where
+  /-- Statements only (`typeDeps`). -/
+  | statement
+  /-- What declarations mean: a definition's statement and the data of its value, the proofs
+  inside it skipped (`dataDeps`). -/
+  | meaning
+  /-- Everything a definition's type and value mention (`deps`), the lemmas its proofs call
+  included: the closure [trust](https://github.com/chrisflav/trust) draws. -/
+  | term
+deriving Repr, BEq, Inhabited
+
+/-- A declaration `Context.closure` reached, with its dependencies. -/
+structure Reached where
+  name : Name
+  info : ConstantInfo
+  /-- Whether it is a proof: a theorem, or a declaration whose type is a proposition. -/
+  isProp : Bool
+  deps : DeclDeps
+deriving Inhabited
+
+/-- The dependencies `follow` takes out of `r`. -/
+def Follow.targets (follow : Follow) (r : Reached) : Array Name :=
+  if r.isProp then r.deps.typeDeps
+  else match follow with
+    | .statement => r.deps.typeDeps
+    | .meaning => r.deps.dataDeps
+    | .term => r.deps.deps
+
+/-- Whether the declaration `info` is a proof: a theorem, or one whose type is a proposition. -/
+def isProofDecl (info : ConstantInfo) : MetaM Bool := do
+  if info matches .thmInfo _ then return true
+  try Meta.isProp info.type catch _ => return false
+
+/-- Every declaration reachable from `roots` along `follow`, with its dependencies: breadth-first, a
+level at a time, each level's dependencies computed in parallel (`depsOf`). The roots come first,
+then each level in the order it was reached. Also returns the context, which now holds the data
+values the walk computed.
+
+It leaves the project only under `Boundary.none`. Under `Boundary.project` an upstream declaration
+the walk reaches is returned with no dependencies, and the walk stops there.
+
+`forProofs` and `forData` name lists to compute besides what `follow` needs, for proofs and for
+everything else. By default nothing more: for a proof, `typeDeps` is all that is followed, and
+walking its proof term (`deps`) would be most of the cost of the walk. -/
+def Context.closure (ctx : Context) (roots : Array Name) (follow : Follow := .meaning)
+    (forProofs : DepsRequest := { deps := false, dataDeps := false })
+    (forData : DepsRequest := { deps := false, dataDeps := false }) :
+    MetaM (Array Reached × Context) := do
+  let forData := match follow with
+    | .statement => forData
+    | .meaning => { forData with dataDeps := true }
+    | .term => { forData with deps := true }
+  let mut ctx := ctx
+  let mut seen : Std.HashSet Name := {}
+  let mut frontier : Array Name := #[]
+  for r in roots do
+    unless seen.contains r do
+      seen := seen.insert r
+      frontier := frontier.push r
+  let mut out : Array Reached := #[]
+  while !frontier.isEmpty do
+    let infos := frontier.filterMap fun n => (ctx.env.find? n).map (n, ·)
+    let props ← infos.mapM fun (_, info) => isProofDecl info
+    let analysed (n : Name) := ctx.options.boundary == .none || ctx.declModule.contains n
+    let proofs := (infos.zip props).filterMap fun (ni, p) => if p && analysed ni.1 then some ni else none
+    let data := (infos.zip props).filterMap fun (ni, p) => if p || !analysed ni.1 then none else some ni
+    if forData.dataDeps then
+      ctx ← ctx.withDataValuesFor (data.map (·.1))
+    let computed := ctx.depsOf proofs forProofs ++ ctx.depsOf data forData
+    let byName : Std.HashMap Name DeclDeps := computed.foldl (fun m (n, d) => m.insert n d) {}
+    let mut next := #[]
+    for ((name, info), isProp) in infos.zip props do
+      let r : Reached := { name, info, isProp, deps := byName.getD name ⟨#[], #[], #[]⟩ }
+      out := out.push r
+      for t in follow.targets r do
+        unless seen.contains t do
+          seen := seen.insert t
+          next := next.push t
+    frontier := next
+  return (out, ctx)
 
 /-- One-shot entry point: the dependencies of every declaration the project rooted at `rootPrefix`
 declares itself. -/
