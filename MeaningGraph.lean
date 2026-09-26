@@ -982,6 +982,77 @@ def Context.allDeclDeps (ctx : Context) (request : DepsRequest := {}) : Array (N
   ctx.depsOf (ctx.constants.filterMap fun (name, _, info) =>
     if ctx.exposed.contains name then some (name, info) else none) request
 
+/-! ## Where a dependency comes from -/
+
+/-- What made `declDeps` report a dependency. -/
+inductive Source where
+  /-- It occurs in the declaration's type. -/
+  | type
+  /-- It occurs in the declaration's value, outside the proofs the data walk skips (for `dataDeps`),
+  or anywhere in the value (for `deps`). -/
+  | value
+  /-- It occurs in the type or value of a helper that was looked through: `chain` is the helpers
+  from the declaration to the one that mentions it, and `proofs` says which of them are proofs
+  (theorems, such as the `_proof_N` Lean lifts out of a definition). -/
+  | helper (chain : List Name) (proofs : List Bool)
+  /-- It is a coercion instance, replayed because the declaration mentions the type it coerces from. -/
+  | coercion
+  /-- It is a constant the declaration's notation expands to. -/
+  | notation
+deriving Repr, BEq, Inhabited
+
+/-- Every source of the dependency of `name` on `target` in `DeclDeps.dataDeps` (`data := true`) or
+`DeclDeps.deps` (`data := false`), as `declDeps` computes them: an empty array when there is no such
+dependency. For a helper chain, the shortest one. Uses the context's data values when it has them. -/
+def Context.sources (ctx : Context) (name : Name) (info : ConstantInfo) (target : Name)
+    (data : Bool := true) : Array Source := Id.run do
+  let env := ctx.env
+  let typeUsed := usedConstantsOf env name info false
+  let valueUsed :=
+    match ctx.dataValueConsts.get? name with
+    | some v => if data then v else (usedConstantsOf env name info true)
+    | none => usedConstantsOf env name info true
+  let notationUsed := ctx.notationDeps.getD name #[]
+  let present : Std.HashSet Name := (typeUsed ++ valueUsed).foldl (·.insert ·) {}
+  let coercions := (typeUsed ++ valueUsed).foldl (init := #[]) fun acc c =>
+    acc ++ (ctx.coercionInstances.getD c #[]).filterMap fun inst =>
+      if inst.witnesses.all present.contains then some inst.name else none
+  let mut out := #[]
+  if typeUsed.contains target then out := out.push .type
+  if valueUsed.contains target && !typeUsed.contains target then out := out.push .value
+  if coercions.contains target then out := out.push .coercion
+  if notationUsed.contains target then out := out.push .notation
+  -- Looking through helpers, breadth-first, as `expandThrough` does, remembering how each helper
+  -- was reached.
+  let seeds := (typeUsed ++ valueUsed ++ coercions ++ notationUsed).filter (!ctx.stopsAt ·)
+  let mut parent : Std.HashMap Name Name := {}
+  let mut queue : Array Name := #[]
+  for h in seeds do
+    unless parent.contains h do
+      parent := parent.insert h name
+      queue := queue.push h
+  let mut k := 0
+  let mut found := false
+  while k < queue.size && !found do
+    let h := queue[k]!
+    k := k + 1
+    let some hi := env.find? h | continue
+    let used := usedConstantsOf env h hi true
+    if used.contains target then
+      let mut chain := [h]
+      let mut cur := h
+      while parent.getD cur name != name do
+        cur := parent.getD cur name
+        chain := cur :: chain
+      let proofs := chain.map fun c => (env.find? c).any (·.isTheorem)
+      out := out.push (.helper chain proofs)
+      found := true
+    for c in used do
+      if !ctx.stopsAt c && !parent.contains c then
+        parent := parent.insert c h
+        queue := queue.push c
+  return out
+
 /-! ## Closures past the project -/
 
 /-- What `Context.closure` follows out of a declaration it reaches. A proof contributes its

@@ -89,4 +89,27 @@ def reach (ctx : Context) (roots : Array Name) (follow : Follow) : MetaM (Std.Ha
     fromThm.erase thm |>.toList.all fromStatement.contains,
     inProject.all fun r => projectCtx.declModule.contains r.name || r.deps.deps.isEmpty]
 
+-- `sources` explains every dependency `declDeps` reports, and none it does not: on one declaration in
+-- five of `Init.Data.List`, for `dataDeps` and for `deps`, against its dependencies and against a
+-- few constants that are not dependencies.
+/-- info: true -/
+#guard_msgs in
+#eval show MetaM Bool from do
+  let env ← getEnv
+  let ctx ← (Context.of env `Init.Data.List).withDataValueConsts
+  let targets := ctx.constants.filterMap fun (name, _, info) =>
+    if ctx.exposed.contains name then some (name, info) else none
+  let mut ok := decide (targets.size > 1000)
+  for h : i in [0:targets.size] do
+    if i % 5 != 0 then continue
+    let (name, info) := targets[i]
+    let (d, _) := ctx.declDeps {} name info
+    for t in d.dataDeps do
+      if (ctx.sources name info t true).isEmpty then ok := false
+    for t in d.deps do
+      if (ctx.sources name info t false).isEmpty then ok := false
+    for t in [``Nat.gcd, ``Classical.choice, ``List.lookup] do
+      if !d.deps.contains t && !(ctx.sources name info t false).isEmpty then ok := false
+  return ok
+
 end MeaningGraph.TestOptions
