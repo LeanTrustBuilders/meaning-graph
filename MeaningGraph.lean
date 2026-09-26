@@ -59,12 +59,13 @@ This is what bounds the analysis: helper constants are expanded *through* (their
 pulled in instead of the helper), and everything outside the project is left alone.
 -/
 
-/-- True if `s` is `pfx` followed by a non-empty sequence of digits, the naming convention used
-by the compiler for auto-generated declarations like `match_1`, `eq_2`, `hcongr_11`. -/
+/-- True if `s` is `pfx` followed by a digit and then digits and underscores, the naming
+convention used by the compiler for auto-generated declarations like `match_1`, `eq_2`,
+`hcongr_11`, and `match_1_1` (a second matcher of that name, inside a private declaration). -/
 def isPrefixWithDigitSuffix (pfx s : String) : Bool :=
   s.startsWith pfx &&
-    let rest := s.drop pfx.length
-    !rest.isEmpty && rest.toString.toList.all Char.isDigit
+    let rest := (s.drop pfx.length).toString.toList
+    rest.head?.any Char.isDigit && rest.all fun c => c.isDigit || c == '_'
 
 /-- True if `s` is a single name component the compiler generates: anything underscore-led
 (`_hyg`, `_proof_3`, `_private`, ...), a `match_<n>`/`eq_<n>`/`hcongr_<n>` helper, or the
@@ -166,13 +167,26 @@ def isAuthored (env : Environment) (name : Name) (info : ConstantInfo) : Bool :=
     false
   else if isInternalName name || name.isInternal || name.isImplementationDetail then
     false
-  else if isAuxRecursor env name || isNoConfusion env name then
+  else if isAuxRecursor env name || isNoConfusion env name || Meta.isMatcherCore env name then
     false
   else if hasConstructorPrefix env name then
     false
   else match info with
     | .ctorInfo _ | .recInfo _ | .quotInfo _ => false
     | _ => true
+
+/-- Whether a declaration is one a person wrote, private or not: `isAuthored`, except that a private
+declaration counts. `isAuthored` reads the `_private` prefix of a private name as the mark of a
+helper; here the name is read without it. The suite's rule for which constants are declarations
+(`Display.declared`, `MeaningGraph.Hash.Rule.meaning`). -/
+def isDeclaration (env : Environment) (n : Name) (info : ConstantInfo) : Bool :=
+  if isPrivateName n then
+    let u := privateToUserName n
+    !env.isProjectionFn n && !(isInternalName u || u.isInternal || u.isImplementationDetail)
+      && !isAuxRecursor env n && !isNoConfusion env n && !Meta.isMatcherCore env n
+      && !hasConstructorPrefix env n
+      && !(info matches .ctorInfo _ | .recInfo _ | .quotInfo _)
+  else isAuthored env n info
 
 /-- Decides whether a declaration is one the project's author actually wrote, as opposed to
 compiler output (recursors, projections, constructor companions, hygienic helpers, ...) or a
@@ -216,6 +230,8 @@ inductive Display where
   | authored
   /-- Those Lean offers for completion (`isCompletionVisible`): trust's rule. -/
   | completion
+  /-- Those a person wrote, private ones included (`isDeclaration`): the suite's rule. -/
+  | declared
 deriving Repr, BEq, Inhabited
 
 /-- Whether `name` is a declaration under `display`. -/
@@ -224,6 +240,7 @@ def Display.accepts (display : Display) (env : Environment) (name : Name) (info 
   match display with
   | .authored => isAuthored env name info
   | .completion => isCompletionVisible env name
+  | .declared => isDeclaration env name info
 
 /-- How a `Context` analyses. -/
 structure Options where
@@ -929,6 +946,36 @@ def Context.declDeps (ctx : Context) (cache : Cache) (name : Name) (info : Const
   ({ typeDeps := dedup typeExpanded, deps := dedup allExpanded, dataDeps := dedup dataExpanded },
     cache)
 
+/-- What the declaration's *source* needs that its elaborated term does not mention: the coercion
+instances whose coerced-from type the declaration mentions in full (anywhere, proofs included), and,
+for a notation, the constants it expands to. Expanded through helpers, deduplicated and filtered by
+visibility like `declDeps`' lists; the updated cache is returned alongside.
+
+These are the `source` dependencies: what a standalone file must bring along to elaborate. They are
+not part of a declaration's meaning, which is what its elaborated term says (`MeaningGraph.Hash`). -/
+def Context.sourceDeps (ctx : Context) (cache : Cache) (name : Name) (info : ConstantInfo) :
+    Array Name × Cache :=
+  let used := usedConstantsOf ctx.env name info true
+  let present : Std.HashSet Name := used.foldl (fun acc c => acc.insert c) {}
+  let coercions := used.foldl (init := #[]) fun acc c =>
+    acc ++ (ctx.coercionInstances.getD c #[]).filterMap fun inst =>
+      if inst.witnesses.all present.contains then some inst.name else none
+  let (expanded, cache) :=
+    expandThrough ctx.env (!ctx.stopsAt ·) cache (coercions ++ ctx.notationDeps.getD name #[])
+  let visible := ctx.visibleModules.getD (ctx.declModule.getD name .anonymous) {}
+  let out := Id.run do
+    let mut seen : Std.HashSet Name := {}
+    let mut out := #[]
+    for dep in expanded do
+      if dep == name || seen.contains dep then continue
+      seen := seen.insert dep
+      let importable := match ctx.declModule.get? dep with
+        | none => true
+        | some mod => visible.contains mod
+      if importable then out := out.push dep
+    return out
+  (out, cache)
+
 /-- Fills `Context.dataValueConsts` for every exposed `.defnInfo`, so that `declDeps` can report
 `DeclDeps.dataDeps`; with `only`, for those of them in `only`.
 
@@ -981,6 +1028,77 @@ def Context.depsOf (ctx : Context) (targets : Array (Name × ConstantInfo))
 def Context.allDeclDeps (ctx : Context) (request : DepsRequest := {}) : Array (Name × DeclDeps) :=
   ctx.depsOf (ctx.constants.filterMap fun (name, _, info) =>
     if ctx.exposed.contains name then some (name, info) else none) request
+
+/-! ## Where a dependency comes from -/
+
+/-- What made `declDeps` report a dependency. -/
+inductive Source where
+  /-- It occurs in the declaration's type. -/
+  | type
+  /-- It occurs in the declaration's value, outside the proofs the data walk skips (for `dataDeps`),
+  or anywhere in the value (for `deps`). -/
+  | value
+  /-- It occurs in the type or value of a helper that was looked through: `chain` is the helpers
+  from the declaration to the one that mentions it, and `proofs` says which of them are proofs
+  (theorems, such as the `_proof_N` Lean lifts out of a definition). -/
+  | helper (chain : List Name) (proofs : List Bool)
+  /-- It is a coercion instance, replayed because the declaration mentions the type it coerces from. -/
+  | coercion
+  /-- It is a constant the declaration's notation expands to. -/
+  | notation
+deriving Repr, BEq, Inhabited
+
+/-- Every source of the dependency of `name` on `target` in `DeclDeps.dataDeps` (`data := true`) or
+`DeclDeps.deps` (`data := false`), as `declDeps` computes them: an empty array when there is no such
+dependency. For a helper chain, the shortest one. Uses the context's data values when it has them. -/
+def Context.sources (ctx : Context) (name : Name) (info : ConstantInfo) (target : Name)
+    (data : Bool := true) : Array Source := Id.run do
+  let env := ctx.env
+  let typeUsed := usedConstantsOf env name info false
+  let valueUsed :=
+    match ctx.dataValueConsts.get? name with
+    | some v => if data then v else (usedConstantsOf env name info true)
+    | none => usedConstantsOf env name info true
+  let notationUsed := ctx.notationDeps.getD name #[]
+  let present : Std.HashSet Name := (typeUsed ++ valueUsed).foldl (·.insert ·) {}
+  let coercions := (typeUsed ++ valueUsed).foldl (init := #[]) fun acc c =>
+    acc ++ (ctx.coercionInstances.getD c #[]).filterMap fun inst =>
+      if inst.witnesses.all present.contains then some inst.name else none
+  let mut out := #[]
+  if typeUsed.contains target then out := out.push .type
+  if valueUsed.contains target && !typeUsed.contains target then out := out.push .value
+  if coercions.contains target then out := out.push .coercion
+  if notationUsed.contains target then out := out.push .notation
+  -- Looking through helpers, breadth-first, as `expandThrough` does, remembering how each helper
+  -- was reached.
+  let seeds := (typeUsed ++ valueUsed ++ coercions ++ notationUsed).filter (!ctx.stopsAt ·)
+  let mut parent : Std.HashMap Name Name := {}
+  let mut queue : Array Name := #[]
+  for h in seeds do
+    unless parent.contains h do
+      parent := parent.insert h name
+      queue := queue.push h
+  let mut k := 0
+  let mut found := false
+  while k < queue.size && !found do
+    let h := queue[k]!
+    k := k + 1
+    let some hi := env.find? h | continue
+    let used := usedConstantsOf env h hi true
+    if used.contains target then
+      let mut chain := [h]
+      let mut cur := h
+      while parent.getD cur name != name do
+        cur := parent.getD cur name
+        chain := cur :: chain
+      let proofs := chain.map fun c => (env.find? c).any (·.isTheorem)
+      out := out.push (.helper chain proofs)
+      found := true
+    for c in used do
+      if !ctx.stopsAt c && !parent.contains c then
+        parent := parent.insert c h
+        queue := queue.push c
+  return out
 
 /-! ## Closures past the project -/
 
