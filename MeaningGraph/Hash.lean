@@ -105,8 +105,8 @@ partial def erase (e : Expr) : EraseM Expr := do
       let v' ← if ← isProp t then pure proofMarker else erase v
       withLetDecl n t v (nondep := nondep) fun x => do
         return .letE n t' v' ((← erase (b.instantiate1 x)).abstract #[x]) nondep
-    | .mdata m b => return .mdata m (← erase b)
-    | .proj s i b => return .proj s i (← erase b)
+    | .mdata m b => pure (.mdata m (← erase b))
+    | .proj s i b => pure (.proj s i (← erase b))
     | _ => pure e
   modify (·.insert e r)
   return r
@@ -245,7 +245,10 @@ def hashLevel (lps : List Name) : Level → UInt64
 abbrev HashM := StateM (Std.HashMap ExprStructEq UInt64)
 
 /-- An expression, with each reference to a constant hashed by `ref`. Binder names and kinds, and
-metadata, are left out. -/
+metadata, are left out. Memoised, so linear in the number of distinct subterms: an expression can
+share subterms so much that it is a tree of 10⁸ nodes on a few hundred (Tau Ceti's F4 root system).
+The match arms must produce their value with `pure`: a `return` would leave the function before the
+result is memoised. -/
 partial def hashExpr (lps : List Name) (ref : Name → UInt64) (e : Expr) : HashM UInt64 := do
   if let some h := (← get).get? e then return h
   let h ← match e with
@@ -254,16 +257,16 @@ partial def hashExpr (lps : List Name) (ref : Name → UInt64) (e : Expr) : Hash
     | .const n ls =>
       if n == proofMarkerName then pure 23
       else pure (mixHash 24 (ls.foldl (fun acc l => mixHash acc (hashLevel lps l)) (ref n)))
-    | .app f a => return mixHash 25 (mixHash (← hashExpr lps ref f) (← hashExpr lps ref a))
-    | .lam _ t b _ => return mixHash 26 (mixHash (← hashExpr lps ref t) (← hashExpr lps ref b))
-    | .forallE _ t b _ => return mixHash 27 (mixHash (← hashExpr lps ref t) (← hashExpr lps ref b))
+    | .app f a => pure <| mixHash 25 (mixHash (← hashExpr lps ref f) (← hashExpr lps ref a))
+    | .lam _ t b _ => pure <| mixHash 26 (mixHash (← hashExpr lps ref t) (← hashExpr lps ref b))
+    | .forallE _ t b _ => pure <| mixHash 27 (mixHash (← hashExpr lps ref t) (← hashExpr lps ref b))
     | .letE _ t v b _ =>
-      return mixHash 28 (mixHash (← hashExpr lps ref t)
+      pure <| mixHash 28 (mixHash (← hashExpr lps ref t)
         (mixHash (← hashExpr lps ref v) (← hashExpr lps ref b)))
     | .lit (.natVal n) => pure (mixHash 29 (hash n))
     | .lit (.strVal s) => pure (mixHash 30 (hash s))
     | .mdata _ b => hashExpr lps ref b
-    | .proj s i b => return mixHash 31 (mixHash (ref s) (mixHash i.toUInt64 (← hashExpr lps ref b)))
+    | .proj s i b => pure <| mixHash 31 (mixHash (ref s) (mixHash i.toUInt64 (← hashExpr lps ref b)))
     | .fvar _ | .mvar _ => pure 32
   modify (·.insert e h)
   return h
