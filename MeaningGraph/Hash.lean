@@ -42,6 +42,15 @@ one rule, so that the two agree by construction (`meaning-hash.md` in LeanTrustB
 content (with the helpers it looks through) changes, or the meaning hash of something it refers to
 does; and that is exactly when something in its closure along the edges changed (up to 64-bit
 collisions). The node rule changes the graph and the local hash, never the meaning hash.
+
+## The content hash (`ltb-content/1`)
+
+The same Merkle hash, from a walk that keeps proofs (`Walk.new env (keepProofs := true)`): nothing
+is erased, and a declaration's content is everything the kernel checked of it: a theorem's statement
+and proof, a definition's type and value, an opaque constant's type and value, an axiom's type,
+inductive blocks as above. Every reference is replaced by the referenced constant's content hash, so
+it is deep through proofs: it changes when a proof anywhere underneath changes, which the meaning
+hash never does. It leaves out names as the meaning hash does, so it too survives renames.
 -/
 
 open Lean Meta
@@ -61,6 +70,10 @@ def Rule.meaning : Rule := { name := "ltb-meaning/1", isNode := isDeclaration }
 /-- The same, with the declarations completion offers (trust's rule, `isCompletionVisible`). -/
 def Rule.completion : Rule :=
   { name := "ltb-meaning/1+completion", isNode := fun env n _ => isCompletionVisible env n }
+
+/-- The name of the content hash, the hash of a walk that keeps proofs, recorded with the hashes it
+gave. Bump it whenever what that walk hashes changes. -/
+def contentHasherName : String := "ltb-content/1"
 
 /-! ## Erasing proofs -/
 
@@ -182,10 +195,12 @@ def mentionsOf (es : Array Expr) (members : Array Name) : Array Name := Id.run d
         out := out.push n
   return out
 
-/-- Builds the block whose head is `head`, erasing its proofs. -/
-def mkBlock (head : Name) : MetaM Block := do
+/-- Builds the block whose head is `head`, erasing its proofs; or, with `keepProofs`, whole: a
+theorem's proof and an opaque constant's value are then part of its content. -/
+def mkBlock (head : Name) (keepProofs : Bool := false) : MetaM Block := do
   let env ← getEnv
   let info ← getConstInfo head
+  let er (e : Expr) : MetaM (Expr × Bool) := if keepProofs then pure (e, false) else eraseOrKeep e
   let mut failed := false
   match info with
   | .inductInfo v =>
@@ -196,12 +211,12 @@ def mkBlock (head : Name) : MetaM Block := do
     let members := inds.map (·.name) ++ ctors.map (·.name) ++ recs
     let mut types := #[]
     for i in inds do
-      let (t, f) ← eraseOrKeep i.type
+      let (t, f) ← er i.type
       types := types.push t
       failed := failed || f
     let mut exprs := types
     for c in ctors do
-      let (t, f) ← eraseOrKeep c.type
+      let (t, f) ← er c.type
       exprs := exprs.push t
       failed := failed || f
     return { head, members, kind := .induct, levelParams := v.levelParams, exprs
@@ -216,6 +231,15 @@ def mkBlock (head : Name) : MetaM Block := do
              statementSize := 1, shape := #[k], statementMentions := mentionsOf exprs #[head]
              mentions := mentionsOf exprs #[head] }
   | _ =>
+    if keepProofs then
+      let (kind, exprs) := match info with
+        | .thmInfo v => (Kind.prop, #[info.type, v.value])
+        | .defnInfo v => (Kind.defn, #[info.type, v.value])
+        | .opaqueInfo v => (Kind.opaque, #[info.type, v.value])
+        | _ => (Kind.opaque, #[info.type])
+      return { head, members := #[head], kind, levelParams := info.levelParams, exprs
+               statementSize := 1, shape := #[], statementMentions := mentionsOf #[info.type] #[head]
+               mentions := mentionsOf exprs #[head] }
     let isProp ← (do if info matches .thmInfo _ then return true else Meta.isProp info.type) <|>
       pure false
     let (type, f₁) ← eraseOrKeep info.type
@@ -288,24 +312,35 @@ def hashName (n : Name) : UInt64 := mixHash 51 (hash n.toString)
 
 /-! ## The walk -/
 
-/-- Everything the walk computed: blocks and their meaning hashes, for every constant reached. -/
+/-- Everything the walk computed: blocks and their hashes, for every constant reached. The hashes
+are meaning hashes, or content hashes for a walk that keeps proofs. -/
 structure Walk where
   rule : Rule
   env : Environment
+  /-- Whether proofs are kept: the walk then reaches everything proofs mention, and its hash is the
+  content hash (`ltb-content/1`) instead of the meaning hash. -/
+  keepProofs : Bool := false
   blocks : Std.HashMap Name Block := {}
   /-- Each constant reached ↦ its block's head and its position in the block. -/
   position : Std.HashMap Name (Name × Nat) := {}
-  /-- Each block ↦ its meaning hash. -/
+  /-- Each block ↦ its hash. -/
   blockHash : Std.HashMap Name UInt64 := {}
   /-- References that were not hashed before the block referring to them (a cycle, which the
   kernel does not allow), hashed by name instead. Should be 0. -/
   unresolved : Nat := 0
 
-/-- The meaning hash of a constant the walk reached: its block's, and its position in it. -/
-def Walk.meaning? (w : Walk) (n : Name) : Option UInt64 := do
+/-- The hash of a constant the walk reached: its block's, and its position in it. The meaning hash,
+or the content hash if the walk keeps proofs. -/
+def Walk.hash? (w : Walk) (n : Name) : Option UInt64 := do
   let (h, i) ← w.position.get? n
   let bh ← w.blockHash.get? h
   return if i == 0 then bh else mixHash bh i.toUInt64
+
+/-- The meaning hash of a constant a walk that erases proofs reached. -/
+def Walk.meaning? (w : Walk) (n : Name) : Option UInt64 := w.hash? n
+
+/-- The content hash of a constant a walk that keeps proofs reached. -/
+def Walk.content? (w : Walk) (n : Name) : Option UInt64 := w.hash? n
 
 /-- Walks everything `roots` rest on and hashes it, reusing what `w` already has: blocks are built
 (proofs erased) the first time they are reached, and hashed once everything they mention is. -/
@@ -321,13 +356,13 @@ def Walk.visit (w : Walk) (roots : Array Name) : MetaM Walk := do
       let some b := w.blocks.get? h | continue
       let mut unresolved := 0
       for m in b.mentions do
-        if (w.meaning? m).isNone then unresolved := unresolved + 1
-      let ref (n : Name) : UInt64 := (w.meaning? n).getD (hashName n)
+        if (w.hash? m).isNone then unresolved := unresolved + 1
+      let ref (n : Name) : UInt64 := (w.hash? n).getD (hashName n)
       w := { w with blockHash := w.blockHash.insert h (b.hash ref), unresolved := w.unresolved + unresolved }
       continue
     if w.blockHash.contains h || started.contains h || !env.contains h then continue
     started := started.insert h
-    let b ← mkBlock h
+    let b ← mkBlock h w.keepProofs
     w := { w with blocks := w.blocks.insert h b
                   position := (b.members.zipIdx).foldl (fun m (n, i) => m.insert n (h, i)) w.position }
     stack := stack.push (h, true)
@@ -336,8 +371,9 @@ def Walk.visit (w : Walk) (roots : Array Name) : MetaM Walk := do
       if !w.blockHash.contains mh && !started.contains mh then stack := stack.push (mh, false)
   return w
 
-/-- A new walk under `rule`. -/
-def Walk.new (env : Environment) (rule : Rule := .meaning) : Walk := { rule, env }
+/-- A new walk under `rule`, which erases proofs unless `keepProofs`. -/
+def Walk.new (env : Environment) (rule : Rule := .meaning) (keepProofs := false) : Walk :=
+  { rule, env, keepProofs }
 
 /-- Whether a constant the walk reached is a declaration under its rule. -/
 def Walk.isNode (w : Walk) (n : Name) : Bool :=

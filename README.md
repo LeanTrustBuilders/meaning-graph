@@ -162,6 +162,13 @@ library side by side: the declarations whose hash moves are exactly those whose 
 changed one, and changing only proofs or binder names moves nothing. On LeanMachineLearning (1,468
 declarations on Mathlib) the walk reaches 12,336 blocks and takes 2 seconds.
 
+**The content hash** (`ltb-content/1`) is the same Merkle hash from a walk that keeps proofs
+(`Walk.new env (keepProofs := true)`, then `Walk.content?`): nothing is erased, and a declaration's
+content is all the kernel checked of it, a theorem's proof and an opaque constant's value included. It
+is deep through proofs, so it moves when a proof anywhere underneath changes, and it leaves names out
+as the meaning hash does. `MeaningGraph.TestHash` checks that it moves on exactly the proofs a change
+rewrote.
+
 `Context.sourceDeps` gives, separately, what a declaration's *source* needs besides its meaning:
 coercion instances and notation.
 

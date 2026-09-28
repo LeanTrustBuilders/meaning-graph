@@ -23,6 +23,11 @@ def meanings (names : Array Name) : MetaM (Array UInt64) := do
   let w ← walk names
   return names.map fun n => (w.meaning? n).getD 0
 
+/-- The content hash of each of `names`, from one walk that keeps proofs. -/
+def contents (names : Array Name) : MetaM (Array UInt64) := do
+  let w ← (Walk.new (← getEnv) (keepProofs := true)).visit names
+  return names.map fun n => (w.content? n).getD 0
+
 /-- Whether `a` and `b` have the same meaning hash. -/
 def same (a b : Name) : MetaM Bool := do
   let hs ← meanings #[a, b]
@@ -147,11 +152,13 @@ end V3
 
 def library : List String := ["base", "uses", "aboutUses", "other", "aboutOther", "S", "S.mk", "mkS", "pair"]
 
-/-- The declarations of `library` whose meaning hash differs between versions `a` and `b`. -/
-def changed (a b : Name) : MetaM (List String) := do
+/-- The declarations of `library` whose meaning hash (or other hash, `hashes`) differs between
+versions `a` and `b`. -/
+def changed (a b : Name) (hashes : Array Name → MetaM (Array UInt64) := meanings) :
+    MetaM (List String) := do
   let names (v : Name) := library.toArray.map fun s => v ++ s.toName
-  let ha ← meanings (names a)
-  let hb ← meanings (names b)
+  let ha ← hashes (names a)
+  let hb ← hashes (names b)
   return (library.zip (ha.zip hb).toList).filterMap fun (s, x, y) => if x != y then some s else none
 
 /-- info: ["base", "uses", "aboutUses", "S", "S.mk", "mkS"] -/
@@ -210,6 +217,36 @@ def localOf (n : Name) : MetaM UInt64 := do
   let w' := { w with blocks := w.blocks.insert ``V1.base (w.blocks.get! ``V2.base) }
   return ((w.localHash {} ``V1.uses).1 == (w'.localHash {} ``V1.uses).1,
     (w.meaning? ``V1.uses) == (w.meaning? ``V2.uses))
+
+/-! ## The content hash
+
+A walk that keeps proofs hashes them too: its hash moves when a proof changes, which the meaning hash
+never does. It leaves names out as the meaning hash does. -/
+
+-- A proof is content; a binder name, and the declaration's own name, are not.
+/-- info: (false, true, true) -/
+#guard_msgs in
+#eval show MetaM _ from do
+  let hs ← contents #[``one₁, ``one₂, ``V1.base, ``V3.base, ``V1.other, ``V2.other]
+  return (hs[0]! == hs[1]!, hs[2]! == hs[3]!, hs[4]! == hs[5]!)
+
+-- What changes meaning changes content.
+/-- info: ["base", "uses", "aboutUses", "S", "S.mk", "mkS"] -/
+#guard_msgs in
+#eval changed `MeaningGraph.TestHash.V1 `MeaningGraph.TestHash.V2 contents
+
+-- Version 3 changes only proofs, which the meaning hash did not see: the content hash sees each.
+/-- info: ["aboutUses", "aboutOther", "mkS"] -/
+#guard_msgs in
+#eval changed `MeaningGraph.TestHash.V1 `MeaningGraph.TestHash.V3 contents
+
+-- The walk that keeps proofs reaches what only proofs mention.
+/-- info: (false, true) -/
+#guard_msgs in
+#eval show MetaM _ from do
+  let w ← walk #[``one₁]
+  let wc ← (Walk.new (← getEnv) (keepProofs := true)).visit #[``one₁]
+  return (w.blocks.contains ``Nat.one_pos, wc.blocks.contains ``Nat.one_pos)
 
 /-! ## Linear in the distinct subterms
 
