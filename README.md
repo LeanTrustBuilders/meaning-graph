@@ -30,67 +30,63 @@ git = "https://github.com/LeanTrustBuilders/meaning-graph"
 rev = "main"
 ```
 
-Given an `Environment` with the project imported and the root module prefix that delimits it:
+Given an `Environment` with the project imported and the root module prefix that delimits it, in
+`MetaM` over that environment:
 
 ```lean
 import MeaningGraph
 open Lean MeaningGraph
 
-def report (env : Environment) : IO Unit := do
-  for (name, d) in declDepsOf env `MyLibrary do
-    IO.println s!"{name}: {d.typeDeps.size} in the statement, {d.deps.size} in all"
+def report : MetaM Unit := do
+  for (name, d) in ← declDepsOf (← getEnv) `MyLibrary do
+    IO.println s!"{name}: {d.statement.size} in the statement, {d.term.size} in all"
 ```
 
-`declDepsOf` is the one-shot form. Beyond a single pass, build the project-wide tables once:
-
-```lean
-let ctx := Context.of env `MyLibrary
-let graph := ctx.allDeclDeps              -- Array (Name × DeclDeps)
-```
-
-`Context.declDeps` answers for one declaration, with an explicit `Cache`; `Context.depsOf` answers for
-many, in parallel, with the same result. Both take a `DepsRequest`: `deps` walks every proof term,
-which is most of the cost, so a caller that needs only what declarations mean asks for
-`{ deps := false }`.
+`declDepsOf` is the one-shot form. `Context.of env root` builds the project's tables once;
+`Context.depsOf ctx names` gives the dependencies of any declarations and returns the context, whose
+walks now reach them, for the next call. `(term := false)` skips the `term` list, which walks every
+proof underneath, most of the cost.
 
 ### Per declaration
 
-`DeclDeps` has three lists:
+`DeclDeps` has three lists, each the edges of one of the walks of `MeaningGraph.Hash`, so each hash
+follows its graph:
 
-- `typeDeps`: what the **statement** mentions, what a reader must understand to know what is claimed;
-- `deps`: the statement and the whole proof or body;
-- `dataDeps`: the statement and the body's *data*, skipping the proofs inside the value. It needs
-  `(← Context.of env root |>.withDataValueConsts)` (in `MetaM`, since whether a field is
-  `Prop`-valued is a typing question), and otherwise equals `deps`. It says what a bundled instance
-  means, without the lemmas its proof fields call.
+- `statement`: what the **statement** mentions, proofs erased: what a reader must understand to know
+  what is claimed;
+- `meaning`: what the declaration **means**, proofs erased everywhere: a proof's statement, a
+  definition's statement and value, an inductive type's types and constructors. The meaning hash
+  follows this graph;
+- `term`: everything the kernel checked of it, **proofs included**. The content hash follows this
+  graph.
 
-### Past the project, and other graphs
+Each looks through helpers wherever they come from, so its targets are declarations.
 
-By default the analysis stops at the project (an upstream constant is a leaf) and a declaration is
-one a person wrote (`isAuthored`). `Options` changes both:
+### Rules and closures
 
-```lean
-let ctx := Context.of env `MyLibrary { boundary := .none, display := .completion }
-```
-
-- `boundary := .none`: any declaration of the environment can be analyzed, and helpers are looked
-  through wherever they come from.
-- `display := .completion`: a declaration is what Lean offers for completion
-  (`Lean.Meta.allowCompletion`), constructors, projections and generated lemmas included.
-
-`Context.closure` walks the graph from some roots, a level at a time in parallel, along a `Follow`
-rule; a proof always contributes only its statement:
-
-- `.statement` follows statements;
-- `.meaning` follows statements and the data of definitions' values (`dataDeps`);
-- `.term` follows everything a definition's value mentions (`deps`), the lemmas its proofs call
-  included.
+`Options` says which constants are declarations (`rule`) and where closures stop (`boundary`):
 
 ```lean
-let (reached, ctx) ← ctx.closure roots .term    -- Array Reached: name, info, isProp, deps
+let ctx := Context.of env `MyLibrary { boundary := .none, rule := .completion }
 ```
 
-Past the project, the notation and coercion recoveries apply to the project's own declarations only.
+- `rule := .meaning` (the default): a declaration is one a person wrote, private ones included.
+  `rule := .completion`: what Lean offers for completion (`Lean.Meta.allowCompletion`),
+  constructors, projections and generated lemmas included. The meaning hash is the same under both;
+  only the graph's nodes differ.
+- `boundary := .none`: closures follow dependencies into the libraries underneath; with the default
+  `.project`, a declaration from outside the project is reached and not followed.
+
+`Context.closure` walks a graph from some roots, a level at a time, along a `Follow`: `.statement`,
+`.meaning` or `.term`. A proof always contributes only its statement, so along `.term` a definition
+is followed whole, the lemmas its proofs call included, and a lemma contributes what it states.
+
+```lean
+let (reached, ctx) ← ctx.closure roots .term    -- Array Reached: name, isProp, deps
+```
+
+`Context.sourceDeps` gives, separately, what a declaration's source needs besides its elaborated
+term: coercion instances and notation. No hash covers these.
 
 ### `MeaningGraph.Hash`: one rule for the graph and the hash
 
@@ -109,16 +105,16 @@ under one rule (`ltb-meaning/1`), so the two agree by construction:
   meaning hash (a Merkle hash, well founded since the kernel only allows references to earlier
   constants or the same block). It covers everything underneath, Lean core included, and does not
   depend on names, binder names or binder kinds.
-- **Edges** (`Walk.targets`) go to the declarations a content mentions, through helpers.
+- **Edges** (`Walk.edges`) go to the declarations a content mentions, through helpers.
 - **The local hash** (`Walk.localHash`) is the same content with references to other declarations by
   name: it changes when the declaration itself is rewritten.
 - **The content hash** (`ltb-content/1`: `Walk.new env (keepProofs := true)`, then `Walk.content?`)
   erases nothing: it covers everything the kernel checked, proofs included, and moves when a proof
   anywhere underneath changes.
 
-So a declaration's meaning hash changes exactly when something in its closure along the edges
-changes (up to 64-bit collisions). `Context.sourceDeps` gives, separately, what a declaration's
-source needs besides its meaning: coercion instances and notation.
+So a declaration's meaning hash changes exactly when something in its `meaning` closure changes, and
+its content hash exactly when something in its `term` closure does (up to 64-bit collisions), whatever
+the rule's nodes.
 
 ### Graph passes
 
@@ -129,7 +125,7 @@ edges first:
 ```lean
 -- A theorem's proof is opaque; take the full body for everything else.
 let edges := graph.map fun (n, d) =>
-  (n, if (env.find? n).any (· matches .thmInfo _) then d.typeDeps else d.deps)
+  (n, if (env.find? n).any (· matches .thmInfo _) then d.statement else d.term)
 let users := reverseDeps edges
 ```
 
@@ -139,11 +135,9 @@ Cycles (mutual recursion) are tolerated.
 
 - The analysis is over the compiled environment, not the source: it cannot see a dependency that
   leaves no trace in the environment.
-- `rootPrefix` bounds the work: a constant is the project's own when its module has that prefix. By
-  default the cost is proportional to the project, not to what it imports; `Boundary.none` makes it
-  proportional to what the closure reaches.
-- Which declarations are the project's own user-written ones is `shouldExpose`; everything else is
-  looked through.
+- The walks go down to Lean core, since a hash covers everything underneath: the cost grows with
+  what the declarations rest on, and `term` with every proof underneath.
+- `rootPrefix` says which constants are the project's: those of the modules with that prefix.
 
 ## Versions
 
@@ -155,10 +149,11 @@ older one (`lean-v4.34.0`). The tags `v4.34.0` and `v4.35.0-rc2` are older snaps
 Both targets are checked at elaboration time: building them runs them.
 
 - `lake build MeaningGraphTest`: the name classification, constant collection, notation and coercion
-  recoveries and graph passes (`MeaningGraph.Test`); the fast walks and the parallel driver against
-  reference implementations, including a term with 2⁶⁴ paths (`TestEquivalence`); the options and
-  closures (`TestOptions`); and the hashes (`TestHash`): proofs, binder names and constant names left
-  out, and a change moving exactly the hashes of what rests on it, on two versions of a small library.
+  recoveries and graph passes (`MeaningGraph.Test`); the notation walk against a reference
+  implementation, including a term with 2⁶⁴ paths (`TestEquivalence`); the rules, the three lists and
+  the closures on Lean core (`TestOptions`); and the hashes (`TestHash`): proofs, binder names and
+  constant names left out, and a change moving exactly the hashes of what rests on it along the
+  hash's graph, meaning and content alike.
 - `lake build MeaningGraphProofs`: theorems about the project boundary and about
   `topologicalClosure`, which is total.
 

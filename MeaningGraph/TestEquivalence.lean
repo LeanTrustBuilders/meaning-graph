@@ -3,11 +3,9 @@ import MeaningGraph
 /-!
 # Speed without a change of result
 
-The notation walk and the dependency driver were rewritten for speed: the walk visits each shared
-subterm once, and `depsOf` runs in parallel. The original implementations are kept here as the
-reference, and the checks below compare the two on real parts of Lean core, where `Context.of`
-works as on any project: `Init.Notation` defines 124 notations, and `Init.Data.List` has 3,246
-declarations to analyse.
+The notation walk was rewritten for speed: it visits each shared subterm once. The original
+implementation is kept here as the reference, and the checks below compare the two, on a term with
+2⁶⁴ paths and on `Init.Notation`, where `Context.of` works as on any project (124 notations).
 
 Unlike `MeaningGraph.Test`, this file is not a `module`. A module imports others at their exported
 level, where definitions come without their values, and the notation table and the value walks
@@ -86,29 +84,5 @@ def sameNotationTable (root : Name) : MetaM Bool := do
 /-- info: true -/
 #guard_msgs in
 #eval sameNotationTable `Init.Notation
-
-/-- Whether `depsOf`, in parallel chunks of `chunk`, gives what `declDeps` gives one declaration at a
-time with one cache, and whether leaving out `deps` changes nothing else. -/
-def sameDeps (root : Name) (chunk : Nat) : MetaM Bool := do
-  let ctx ← (Context.of (← getEnv) root).withDataValueConsts
-  let targets := ctx.constants.filterMap fun (name, _, info) =>
-    if ctx.exposed.contains name then some (name, info) else none
-  let mut cache : Cache := {}
-  let mut sequential : Array (Name × DeclDeps) := #[]
-  for (name, info) in targets do
-    let (d, cache') := ctx.declDeps cache name info
-    cache := cache'
-    sequential := sequential.push (name, d)
-  let parallel := ctx.depsOf targets (chunk := chunk)
-  let lean := ctx.depsOf targets { deps := false } (chunk := chunk)
-  let same (a b : DeclDeps) := a.typeDeps == b.typeDeps && a.deps == b.deps && a.dataDeps == b.dataDeps
-  return targets.size > 1000 && parallel.size == sequential.size &&
-    (parallel.zip sequential).all (fun ((n, a), (m, b)) => n == m && same a b) &&
-    (lean.zip sequential).all fun ((_, a), (_, b)) =>
-      a.typeDeps == b.typeDeps && a.dataDeps == b.dataDeps && a.deps.isEmpty
-
-/-- info: true -/
-#guard_msgs in
-#eval sameDeps `Init.Data.List 100
 
 end MeaningGraph.TestEquivalence

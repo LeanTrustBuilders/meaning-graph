@@ -8,8 +8,8 @@ defaultTargets = ["MeaningGraph"]
 # every consumer inherits.
 [[lean_lib]]
 name = "MeaningGraph"
-# `MeaningGraph.Hash` imports `MeaningGraph`, so it is a root of its own.
-roots = ["MeaningGraph", "MeaningGraph.Hash"]
+# `MeaningGraph` imports `MeaningGraph.Basic`, `.Hash` and `.Deps`.
+roots = ["MeaningGraph"]
 
 # The `#guard` checks and the theorems, as two targets separate from the library: they are not part
 # of what a consumer imports, and both are checked at elaboration time, so building either one *is*

@@ -1,6 +1,6 @@
 module
 
-public import MeaningGraph
+public import MeaningGraph.Basic
 
 @[expose] public section
 
@@ -51,6 +51,11 @@ and proof, a definition's type and value, an opaque constant's type and value, a
 inductive blocks as above. Every reference is replaced by the referenced constant's content hash, so
 it is deep through proofs: it changes when a proof anywhere underneath changes, which the meaning
 hash never does. It leaves out names as the meaning hash does, so it too survives renames.
+
+**Each hash has its graph.** `Walk.edges` gives a declaration's edges from the walk's own blocks:
+under the walk that erases proofs, the `statement` and `meaning` edges; under the one that keeps
+them, the `term` edges. So the meaning hash follows the `meaning` graph and the content hash the
+`term` graph, by construction, whatever the rule's nodes.
 -/
 
 open Lean Meta
@@ -66,6 +71,8 @@ structure Rule where
 
 /-- The suite's rule: declarations are those a person wrote, private ones included. -/
 def Rule.meaning : Rule := { name := "ltb-meaning/1", isNode := isDeclaration }
+
+instance : Inhabited Rule := ⟨.meaning⟩
 
 /-- The same, with the declarations completion offers (trust's rule, `isCompletionVisible`). -/
 def Rule.completion : Rule :=
@@ -423,6 +430,22 @@ partial def Walk.targets (w : Walk) (names : Array Name)
             seen := seen.insert t
             out := out.push t
     return (out, memo)
+
+/-- The edges of `n`, which the walk has visited: the declarations its statement mentions, and those
+its whole content mentions, looking through helpers (`targets`); an inductive type also rests on the
+other types of its mutual block that are declarations. Under a walk that erases proofs these are the
+`statement` and `meaning` edges, which the meaning hash follows; under one that keeps proofs, the
+content ones are the `term` edges, which the content hash follows. The memo is `targets`'. -/
+def Walk.edges (w : Walk) (n : Name) (memo : Std.HashMap Name (Array Name) := {}) :
+    (Array Name × Array Name) × Std.HashMap Name (Array Name) :=
+  match w.blocks.get? (blockHead w.env n) with
+  | none => ((#[], #[]), memo)
+  | some b =>
+    let (statement, memo) := w.targets b.statementMentions memo
+    let (content, memo) := w.targets b.mentions memo
+    let siblings := if b.kind == .induct then b.members.filter fun m => m != n && w.isNode m &&
+        (w.env.find? m matches some (.inductInfo _)) else #[]
+    ((statement.filter (· != n), (content ++ siblings).filter (· != n)), memo)
 
 /-- The declaration that owns the helper `n`: the longest proper prefix of its name (private
 prefix removed) that names a declaration. -/

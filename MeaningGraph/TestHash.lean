@@ -1,4 +1,4 @@
-import MeaningGraph.Hash
+import MeaningGraph
 
 /-!
 # The meaning hash, and the graph it is computed with
@@ -33,9 +33,10 @@ def same (a b : Name) : MetaM Bool := do
   let hs ← meanings #[a, b]
   return hs[0]! == hs[1]!
 
-/-- The declarations `n`'s content reaches, looking through helpers. -/
-def targets (n : Name) (statement := false) : MetaM (Array Name) := do
-  let w ← walk #[n]
+/-- The declarations `n`'s content reaches, looking through helpers: under the walk that erases
+proofs, or, with `keepProofs`, the one that keeps them. -/
+def targets (n : Name) (statement := false) (keepProofs := false) : MetaM (Array Name) := do
+  let w ← (Walk.new (← getEnv) (keepProofs := keepProofs)).visit #[n]
   let some b := w.blocks.get? (blockHead w.env n) | return #[]
   return (w.targets (if statement then b.statementMentions else b.mentions)).1
 
@@ -152,14 +153,14 @@ end V3
 
 def library : List String := ["base", "uses", "aboutUses", "other", "aboutOther", "S", "S.mk", "mkS", "pair"]
 
-/-- The declarations of `library` whose meaning hash (or other hash, `hashes`) differs between
+/-- The declarations of `decls` whose meaning hash (or other hash, `hashes`) differs between
 versions `a` and `b`. -/
-def changed (a b : Name) (hashes : Array Name → MetaM (Array UInt64) := meanings) :
-    MetaM (List String) := do
-  let names (v : Name) := library.toArray.map fun s => v ++ s.toName
+def changed (a b : Name) (hashes : Array Name → MetaM (Array UInt64) := meanings)
+    (decls : List String := library) : MetaM (List String) := do
+  let names (v : Name) := decls.toArray.map fun s => v ++ s.toName
   let ha ← hashes (names a)
   let hb ← hashes (names b)
-  return (library.zip (ha.zip hb).toList).filterMap fun (s, x, y) => if x != y then some s else none
+  return (decls.zip (ha.zip hb).toList).filterMap fun (s, x, y) => if x != y then some s else none
 
 /-- info: ["base", "uses", "aboutUses", "S", "S.mk", "mkS"] -/
 #guard_msgs in
@@ -169,28 +170,30 @@ def changed (a b : Name) (hashes : Array Name → MetaM (Array UInt64) := meanin
 #guard_msgs in
 #eval changed `MeaningGraph.TestHash.V1 `MeaningGraph.TestHash.V3
 
-/-- What rests on `base`, by the graph: the declarations of `V1` whose closure reaches it. -/
-def restsOnBase : MetaM (List String) := do
-  let v := `MeaningGraph.TestHash.V1
+/-- What rests on `target`, by a graph: the declarations of `decls`, in version `v`, whose closure
+reaches it, along the edges of the walk that erases proofs (the `meaning` graph) or, with
+`keepProofs`, of the one that keeps them (the `term` graph). -/
+def restsOn (v : Name) (target : String) (decls : List String := library) (keepProofs := false) :
+    MetaM (List String) := do
   let mut out := []
-  for s in library do
+  for s in decls do
     let mut seen : Std.HashSet Name := {}
     let mut todo := #[v ++ s.toName]
     while !todo.isEmpty do
       let n := todo.back!
       todo := todo.pop
-      for t in ← targets n do
+      for t in ← targets n (keepProofs := keepProofs) do
         if !seen.contains t then
           seen := seen.insert t
           todo := todo.push t
-    if s == "base" || seen.contains (v ++ `base) then out := out ++ [s]
+    if s == target || seen.contains (v ++ target.toName) then out := out ++ [s]
   return out
 
 -- The same list: the graph and the hash agree. (`S.mk` is not a declaration; it rests on `base`
 -- through `S`.)
 /-- info: ["base", "uses", "aboutUses", "S", "S.mk", "mkS"] -/
 #guard_msgs in
-#eval restsOnBase
+#eval restsOn `MeaningGraph.TestHash.V1 "base"
 
 /-! ## The local hash -/
 
@@ -247,6 +250,44 @@ never does. It leaves names out as the meaning hash does. -/
   let w ← walk #[``one₁]
   let wc ← (Walk.new (← getEnv) (keepProofs := true)).visit #[``one₁]
   return (w.blocks.contains ``Nat.one_pos, wc.blocks.contains ``Nat.one_pos)
+
+/-! ## The content hash follows the `term` graph
+
+`W2` changes only the proof of `pos`, which `threePos` uses, which `three` uses inside its value.
+(Through a theorem of its own: Lean shares an auxiliary proof between declarations with the same
+statement, so a proof written inside `three` would be `W1`'s in both versions.) -/
+
+namespace W1
+theorem pos (n : Nat) : 0 < n + 1 := Nat.succ_pos n
+theorem threePos : 0 < 3 := pos 2
+def three : PosNat := ⟨3, threePos⟩
+def four : Nat := 4
+end W1
+
+namespace W2
+theorem pos (n : Nat) : 0 < n + 1 := by omega
+theorem threePos : 0 < 3 := pos 2
+def three : PosNat := ⟨3, threePos⟩
+def four : Nat := 4
+end W2
+
+def small : List String := ["pos", "threePos", "three", "four"]
+
+-- `threePos` is what `three` rests on along `term`, not along `meaning`, where its proof is erased.
+/-- info: (false, true) -/
+#guard_msgs in
+#eval show MetaM _ from do
+  let (deps, _) ← (Context.of (← getEnv) `MeaningGraph.TestHash).depsOf #[``W1.three]
+  let d := deps[0]!.2
+  return (d.meaning.contains ``W1.threePos, d.term.contains ``W1.threePos)
+
+-- No meaning hash moves; the content hashes that move are those of what rests on `pos` along `term`.
+/-- info: ([], ["pos", "threePos", "three"], ["pos", "threePos", "three"]) -/
+#guard_msgs in
+#eval show MetaM _ from do
+  return (← changed `MeaningGraph.TestHash.W1 `MeaningGraph.TestHash.W2 meanings small,
+    ← changed `MeaningGraph.TestHash.W1 `MeaningGraph.TestHash.W2 contents small,
+    ← restsOn `MeaningGraph.TestHash.W1 "pos" small (keepProofs := true))
 
 /-! ## Linear in the distinct subterms
 
