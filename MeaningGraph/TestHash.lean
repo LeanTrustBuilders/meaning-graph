@@ -200,7 +200,7 @@ def restsOn (v : Name) (target : String) (decls : List String := library) (keepP
 /-- The local hash of `n`. -/
 def localOf (n : Name) : MetaM UInt64 := do
   let w ← walk #[n]
-  return (w.localHash {} n).1
+  return (w.localHash n).1
 
 -- References to other declarations are by name: `V1.uses` and `V2.uses` have the same text, but
 -- refer to different names, so differ; `V1.other`'s and `V2.other`'s are the same.
@@ -218,7 +218,7 @@ def localOf (n : Name) : MetaM UInt64 := do
   -- Pretend `V1.base` had `V2.base`'s content: `V1.uses`' local hash does not move, its meaning
   -- hash would.
   let w' := { w with blocks := w.blocks.insert ``V1.base (w.blocks.get! ``V2.base) }
-  return ((w.localHash {} ``V1.uses).1 == (w'.localHash {} ``V1.uses).1,
+  return ((w.localHash ``V1.uses).1 == (w'.localHash ``V1.uses).1,
     (w.meaning? ``V1.uses) == (w.meaning? ``V2.uses))
 
 /-! ## The content hash

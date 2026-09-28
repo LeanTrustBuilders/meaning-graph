@@ -447,20 +447,26 @@ def Walk.edges (w : Walk) (n : Name) (memo : Std.HashMap Name (Array Name) := {}
         (w.env.find? m matches some (.inductInfo _)) else #[]
     ((statement.filter (· != n), (content ++ siblings).filter (· != n)), memo)
 
-/-- The declaration that owns the helper `n`: the longest proper prefix of its name (private
-prefix removed) that names a declaration. -/
-def ownerOf? (byUserName : Std.HashMap Name Name) (n : Name) : Option Name :=
+/-- The declaration that owns the helper `n`: the longest proper prefix of its name that names a
+declaration under the walk's rule; for a private helper, the private declaration of the same module
+of that name, or else the public one. It depends on the environment only, not on which declarations
+a dataset has as nodes. -/
+def Walk.ownerOf? (w : Walk) (n : Name) : Option Name :=
   go (privateToUserName n).getPrefix
 where
+  found (p : Name) : Option Name :=
+    match (privatePrefix? n).map (· ++ p) with
+    | some q => if w.isNode q then some q else if w.isNode p then some p else none
+    | none => if w.isNode p then some p else none
   go : Name → Option Name
     | .anonymous => none
-    | p@(.str q _) => (byUserName.get? p).orElse fun _ => go q
-    | p@(.num q _) => (byUserName.get? p).orElse fun _ => go q
+    | p@(.str q _) => (found p).orElse fun _ => go q
+    | p@(.num q _) => (found p).orElse fun _ => go q
 
 /-- The local hash of declaration `d`: its content, with references to other declarations, to
 constants outside the walk and to the helpers other declarations own, by name; the helpers it owns
 and the helpers nobody owns are looked through, by their own local content. -/
-partial def Walk.localHash (w : Walk) (byUserName : Std.HashMap Name Name) (d : Name)
+partial def Walk.localHash (w : Walk) (d : Name)
     (memo : Std.HashMap (Name × Name) UInt64 := {}) : UInt64 × Std.HashMap (Name × Name) UInt64 :=
   Id.run do
     let some b := w.blocks.get? (blockHead w.env d) | return (hashName d, memo)
@@ -469,7 +475,7 @@ partial def Walk.localHash (w : Walk) (byUserName : Std.HashMap Name Name) (d : 
     for m in b.mentions do
       let h := blockHead w.env m
       let byName := (w.nodeFor? m).isSome || !w.blocks.contains h ||
-        match ownerOf? byUserName m with
+        match w.ownerOf? m with
         | some o => o != d
         | none => false
       if byName then
@@ -480,7 +486,7 @@ partial def Walk.localHash (w : Walk) (byUserName : Std.HashMap Name Name) (d : 
           | some hh => pure hh
           | none =>
             memo := memo.insert key (hashName m)
-            let (hh, memo') := w.localHash byUserName h memo
+            let (hh, memo') := w.localHash h memo
             memo := memo'.insert key hh
             pure hh
         let i := ((w.position.get? m).map (·.2)).getD 0
