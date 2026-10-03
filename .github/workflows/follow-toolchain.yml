@@ -1,0 +1,29 @@
+name: Follow Mathlib's toolchain
+# Every hour: when Mathlib's master moves to another Lean toolchain, keep the old one on the branch
+# lean-v<old toolchain>, move main to the new one once it builds with its tests and proofs, and
+# release it as v<toolchain>. A build that fails opens an issue (the extractor's follow-toolchain
+# action).
+on:
+  schedule:
+    - cron: '5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: follow-toolchain
+  cancel-in-progress: false
+
+jobs:
+  follow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: LeanTrustBuilders/extractor/follow-toolchain@main
+        with:
+          build: MeaningGraph MeaningGraphTest MeaningGraphProofs
