@@ -42,7 +42,8 @@ def report : MetaM Unit := do
     IO.println s!"{name}: {d.statement.size} in the statement, {d.term.size} in all"
 ```
 
-`declDepsOf` is the one-shot form. `Context.of env root` builds the project's tables once;
+`declDepsOf` is the one-shot form. `Context.of env root` builds the project's tables once, and
+`Context.ofModules env inProject` for a project given by its modules, closed downstream;
 `Context.depsOf ctx names` gives the dependencies of any declarations and returns the context, whose
 walks now reach them, for the next call. `(term := false)` skips the `term` list, which walks every
 proof underneath, most of the cost.
@@ -137,7 +138,8 @@ Cycles (mutual recursion) are tolerated.
   leaves no trace in the environment.
 - The walks go down to Lean core, since a hash covers everything underneath: the cost grows with
   what the declarations rest on, and `term` with every proof underneath.
-- `rootPrefix` says which constants are the project's: those of the modules with that prefix.
+- The project's constants are those of its modules: the modules with the root prefix, or those
+  `inProject` accepts.
 
 ## Versions
 

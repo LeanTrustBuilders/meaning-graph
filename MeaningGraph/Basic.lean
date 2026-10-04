@@ -176,9 +176,9 @@ constructors, projections, `Quot` primitives and the lemmas Lean generates under
 def isCompletionVisible (env : Environment) (name : Name) : Bool :=
   Lean.Meta.allowCompletion env name && !(privateToUserName name).isInternalDetail
 
-/-- All constants belonging to modules whose name has `rootPrefix`, paired with their module
-name, gathered directly from `env.header.moduleData` so that the (typically much larger) set of
-constants from imported libraries is never iterated.
+/-- All constants belonging to the modules `inProject` accepts, paired with their module name,
+gathered directly from `env.header.moduleData` so that the (typically much larger) set of constants
+from imported libraries is never iterated.
 
 Each name appears exactly once, attributed to the module `env.getModuleIdxFor?` records for it.
 That is not redundant with walking the per-module tables: two modules that are never imported into
@@ -188,10 +188,11 @@ files of disjoint subtrees, which `lake build` accepts), and then the name sits 
 `declByName`, and the environment queries for docstrings, ranges and dependencies — so the walk
 must pick one occurrence, and it must pick the *same* one those env queries answer for, or the
 declaration would be attributed to one module and sourced from another. -/
-def projectConstants (env : Environment) (rootPrefix : Name) : Array (Name × Name × ConstantInfo) :=
+def projectConstants (env : Environment) (inProject : Name → Bool) :
+    Array (Name × Name × ConstantInfo) :=
   (Array.range env.header.modules.size).foldl (fun acc idx =>
     let modName := env.header.modules[idx]!.module
-    if hasPrefixName modName rootPrefix then
+    if inProject modName then
       let data := env.header.moduleData[idx]!
       (Array.zip data.constNames data.constants).foldl
         (fun acc2 (cname, cinfo) =>
@@ -202,11 +203,12 @@ def projectConstants (env : Environment) (rootPrefix : Name) : Array (Name × Na
 /-- Names declared in more than one project module, with the modules that carry them; see
 `projectConstants`, which keeps a single occurrence of each. Exposed separately so `collect` can
 say which copies the site will not show, instead of dropping them silently. -/
-def duplicatedProjectConstants (env : Environment) (rootPrefix : Name) : Array (Name × Array Name) :=
+def duplicatedProjectConstants (env : Environment) (inProject : Name → Bool) :
+    Array (Name × Array Name) :=
   let byName := (Array.range env.header.modules.size).foldl (init := ({} : Std.HashMap Name (Array Name)))
     fun acc idx =>
       let modName := env.header.modules[idx]!.module
-      if hasPrefixName modName rootPrefix then
+      if inProject modName then
         env.header.moduleData[idx]!.constNames.foldl
           (fun acc2 cname => acc2.insert cname ((acc2.getD cname #[]).push modName)) acc
       else acc
@@ -455,7 +457,7 @@ not even import the one defining the instance, so the edge was not merely useles
 
 `witnesses` records the other project constants in the coerced-from type (`SquareIntegrable` here),
 and `Context.sourceDeps` only replays the instance for declarations that mention all of them. -/
-def coercionInstancesByType (env : Environment) (rootPrefix : Name) (exposed : Std.HashSet Name)
+def coercionInstancesByType (env : Environment) (inProject : Name → Bool) (exposed : Std.HashSet Name)
     (projectConsts : Array (Name × Name × ConstantInfo)) :
     Std.HashMap Name (Array CoercionInstance) := Id.run do
   let mut m : Std.HashMap Name (Array CoercionInstance) := {}
@@ -464,7 +466,7 @@ def coercionInstancesByType (env : Environment) (rootPrefix : Name) (exposed : S
       if let some src := coercionSource? cinfo.type then
         if let some head := src.getAppFn.constName? then
           let witnesses := src.getUsedConstants.filter fun c =>
-            c != head && isProjectLocalConst env rootPrefix c
+            c != head && (moduleNameOf env c).any inProject
           m := m.insert head ((m.getD head #[]).push { name := cname, witnesses })
   return m
 
@@ -507,24 +509,25 @@ where
 /-- For each project module, the project modules it can see: itself plus everything it imports,
 transitively.
 
-Only project modules are tracked. A project module can only be reached from another project module
-(nothing upstream imports the project), so reachability among them never leaves the set.
+Only project modules, those `inProject` accepts, are tracked. A project module can only be reached
+from another project module (nothing upstream imports the project, which is closed downstream), so
+reachability among them never leaves the set.
 
 Relies on `moduleNames` being in dependency order — Lean writes a module's imports before the
 module itself — so one forward pass suffices. -/
-def visibleProjectModules (env : Environment) (rootPrefix : Name) :
+def visibleProjectModules (env : Environment) (inProject : Name → Bool) :
     Std.HashMap Name (Std.HashSet Name) := Id.run do
   let names := env.header.moduleNames
   let data := env.header.moduleData
   let mut visible : Std.HashMap Name (Std.HashSet Name) := {}
   for i in [0:names.size] do
     let modName := names[i]!
-    if !hasPrefixName modName rootPrefix then
+    if !inProject modName then
       continue
     let mut seen : Std.HashSet Name := ({} : Std.HashSet Name).insert modName
     if h : i < data.size then
       for imp in data[i].imports do
-        if hasPrefixName imp.module rootPrefix then
+        if inProject imp.module then
           seen := seen.insert imp.module
           for m in visible.getD imp.module {} do
             seen := seen.insert m

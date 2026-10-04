@@ -20,7 +20,8 @@ Each looks through the constants that are not declarations under the rule (`Opti
 they come from. `Context.sourceDeps` gives, apart, what a declaration's *source* needs that its
 elaborated term does not mention: coercion instances and notation. No hash covers those.
 
-`Context.of env rootPrefix` computes the project's tables once; `Context.depsOf` then gives the lists
+`Context.of env rootPrefix` (or `Context.ofModules env inProject`, for a project given by its
+modules) computes the project's tables once; `Context.depsOf` then gives the lists
 of any declarations, extending the walks as it goes, and `Context.closure` walks a graph from some
 roots.
 -/
@@ -64,9 +65,9 @@ extends as it reaches new declarations. -/
 structure Context where
   env : Environment
   options : Options := {}
-  /-- Root module prefix delimiting the project: a constant is the project's when the module
-  declaring it has this prefix (`isProjectLocalConst`). -/
-  rootPrefix : Name
+  /-- Whether a module is the project's: a constant is the project's when the module declaring it
+  is (`Context.isProjectConst`). -/
+  inProject : Name → Bool
   /-- Every constant declared by a project module, as `(name, module, info)`. -/
   constants : Array (Name × Name × ConstantInfo)
   /-- The project's declarations under the rule. -/
@@ -87,18 +88,30 @@ structure Context where
   meaningMemo : Std.HashMap Name (Array Name) := {}
   contentMemo : Std.HashMap Name (Array Name) := {}
 
-/-- Scans `env` for the project rooted at `rootPrefix` and builds its tables, with empty walks. -/
-def Context.of (env : Environment) (rootPrefix : Name) (options : Options := {}) : Context :=
-  let constants := projectConstants env rootPrefix
+/-- Scans `env` for the project made of the modules `inProject` accepts and builds its tables, with
+empty walks. The project must be closed downstream: a module importing one of its modules is one of
+them (`visibleProjectModules`). -/
+def Context.ofModules (env : Environment) (inProject : Name → Bool) (options : Options := {}) :
+    Context :=
+  let constants := projectConstants env inProject
   let exposed : Std.HashSet Name := constants.foldl (fun acc (name, _, info) =>
     if options.rule.isNode env name info then acc.insert name else acc) {}
-  { env, options, rootPrefix, constants, exposed
+  { env, options, inProject, constants, exposed
     notationDeps := notationExpansionDeps env constants
-    coercionInstances := coercionInstancesByType env rootPrefix exposed constants
+    coercionInstances := coercionInstancesByType env inProject exposed constants
     declModule := constants.foldl (fun acc (name, mod, _) => acc.insert name mod) {}
-    visibleModules := visibleProjectModules env rootPrefix
+    visibleModules := visibleProjectModules env inProject
     meaningWalk := Walk.new env options.rule
     contentWalk := Walk.new env options.rule (keepProofs := true) }
+
+/-- `Context.ofModules` for the project rooted at `rootPrefix`: the modules whose names have it as a
+prefix. -/
+def Context.of (env : Environment) (rootPrefix : Name) (options : Options := {}) : Context :=
+  Context.ofModules env (hasPrefixName · rootPrefix) options
+
+/-- Whether `name` is the project's: declared by one of its modules. -/
+def Context.isProjectConst (ctx : Context) (name : Name) : Bool :=
+  (moduleNameOf ctx.env name).any ctx.inProject
 
 /-- Whether `n` is a declaration under the rule: a node of the graphs, where looking through stops. -/
 def Context.isNode (ctx : Context) (n : Name) : Bool :=

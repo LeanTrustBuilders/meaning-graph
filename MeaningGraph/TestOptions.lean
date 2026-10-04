@@ -25,6 +25,23 @@ namespace MeaningGraph.TestOptions
   return [``Prod.fst, ``Prod.mk, ``Nat.rec, ``Nat.gcd].map fun n =>
     (suite.isNode n, completion.isNode n)
 
+-- A project given by its modules (`Context.ofModules`): two prefixes make one project, with the
+-- declarations of both, and its modules see each other across them, which neither prefix's project
+-- records.
+/-- info: (true, true, true, false) -/
+#guard_msgs in
+#eval show MetaM (Bool × Bool × Bool × Bool) from do
+  let env ← getEnv
+  let list := Context.of env `Init.Data.List
+  let array := Context.of env `Init.Data.Array
+  let both := Context.ofModules env fun m =>
+    hasPrefixName m `Init.Data.List || hasPrefixName m `Init.Data.Array
+  let seesList (ctx : Context) := ctx.visibleModules.toList.any fun (m, seen) =>
+    hasPrefixName m `Init.Data.Array && seen.toList.any (hasPrefixName · `Init.Data.List)
+  return (both.exposed.size == list.exposed.size + array.exposed.size,
+    both.isProjectConst ``Array.foldl && !both.isProjectConst ``Nat.gcd,
+    seesList both, seesList array)
+
 /-- Whether every dependency of `names` is a declaration under the context's rule. -/
 def onlyNodes (ctx : Context) (names : Array Name) : MetaM Bool := do
   let (deps, ctx) ← ctx.depsOf names
