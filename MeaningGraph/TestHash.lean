@@ -310,14 +310,16 @@ def doubling : Nat → Expr
 
 /-! ## Private names with macro scopes
 
-`privatePrefix?` of a private name with macro scopes is the whole name: such a name has no private
-candidate owner, rather than a `++` of two names with macro scopes, which panics. -/
+The private candidate of a private name with macro scopes is in its module, with the macro scopes
+of `p`: `privatePrefix?` is the prefix `_private.M.0` alone, so `++` never meets two names with
+macro scopes, which panics. -/
 
 /-- `_private.M.0.<s>`, a private name of module `M`. -/
 def privateName (s : String) : Name := .mkStr (.mkNum `_private.M 0) s
 
 #guard privateCandidate? (privateName "foo") `bar == some (privateName "bar")
-#guard privateCandidate? (addMacroScope `M (privateName "foo") 3) (addMacroScope `M `bar 4) == none
+#guard privateCandidate? (addMacroScope `M (privateName "foo") 3) (addMacroScope `M `bar 4) ==
+  some (addMacroScope `M (privateName "bar") 4)
 #guard privateCandidate? `foo `bar == none
 
 end MeaningGraph.TestHash

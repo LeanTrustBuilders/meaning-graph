@@ -448,10 +448,9 @@ def Walk.edges (w : Walk) (n : Name) (memo : Std.HashMap Name (Array Name) := {}
     ((statement.filter (· != n), (content ++ siblings).filter (· != n)), memo)
 
 /-- The private declaration named `p` in the module of `n`, when `n` is private: the owner
-`Walk.ownerOf?` tries before the public `p`. A private name with macro scopes has none:
-`privatePrefix?` of such a name is the whole name, and `++` panics on two names with macro scopes. -/
+`Walk.ownerOf?` tries before the public `p`. -/
 def privateCandidate? (n p : Name) : Option Name :=
-  ((privatePrefix? n).filter (!·.hasMacroScopes)).map (· ++ p)
+  (privatePrefix? n).map (· ++ p)
 
 /-- The declaration that owns the helper `n`: the longest proper prefix of its name that names a
 declaration under the walk's rule; for a private helper, the private declaration of the same module
